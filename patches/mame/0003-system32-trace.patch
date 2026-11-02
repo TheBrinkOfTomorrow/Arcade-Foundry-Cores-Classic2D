@@ -1,0 +1,291 @@
+# V60/V70 and System 32 oracle for OutRunners and Rad Rally. Applies on top
+# of the Model 1/2 cores repo patch 0006-model1-v60-trace.patch (M1TRACE_*):
+# adds M1TRACE_PCLOG_EVERY, M1TRACE_FRAMES (one line per screen 0 update, both
+# System 32 and Multi 32), M1TRACE_DUMP=DIR (each frame as DIR/f<n>.ppm) and
+# M1TRACE_REPLAY (input replay keyed on start_of_vblank_int; the format
+# s32_trace --replay reads).
+# Build: make SUBTARGET=s32 SOURCES=src/mame/sega/segas32.cpp USE_QTDEBUG=0
+
+--- a/src/devices/cpu/v60/v60.cpp
++++ b/src/devices/cpu/v60/v60.cpp
+@@ -449,6 +449,9 @@
+ 			m_pc_log = fopen(p, "w");
+ 			const char *mx = getenv("M1TRACE_PCLOG_MAX");
+ 			m_pc_log_max = mx ? strtoull(mx, nullptr, 0) : 200000;
++			// M1TRACE_PCLOG_EVERY (a power of two): every Nth instruction only
++			const char *ev = getenv("M1TRACE_PCLOG_EVERY");
++			m_pc_log_mask = ev ? strtoull(ev, nullptr, 0) - 1 : 0;
+ 		}
+ 		p = getenv("M1TRACE_PCS");
+ 		if (p && *p)
+@@ -672,7 +675,7 @@
+ 		{
+ 			if (!m_pc_seen.empty())
+ 				m_pc_seen[(m_PPC & 0xffffff) >> 6] |= uint64_t(1) << (m_PPC & 63);
+-			if (m_pc_log && m_insn_count < m_pc_log_max)
++			if (m_pc_log && m_insn_count < m_pc_log_max && !(m_insn_count & m_pc_log_mask))
+ 			{
+ 				uint64_t h = 0xcbf29ce484222325ULL;
+ 				for (int i = 0; i < 32; i++)
+--- a/src/devices/cpu/v60/v60.h
++++ b/src/devices/cpu/v60/v60.h
+@@ -148,6 +148,10 @@
+ 	std::vector<uint64_t> m_pc_seen;
+ 	std::string m_pc_seen_path;
+ 	void trace_access(int is_write, int sp, offs_t a, u32 v, int size);
++	uint64_t m_pc_log_mask = 0;
++public:
++	uint64_t trace_insn_count() const { return m_insn_count; }
++private:
+ 	void trace_sample();
+ 	void trace_rec(uint8_t type, const void *p, uint32_t n);
+ 
+diff --git a/src/mame/sega/segas32.cpp b/src/mame/sega/segas32.cpp
+index e987382737..6cb50be809 100644
+--- a/src/mame/sega/segas32.cpp
++++ b/src/mame/sega/segas32.cpp
+@@ -800,8 +800,61 @@ TIMER_CALLBACK_MEMBER(segas32_state::end_of_vblank_int)
+ }
+ 
+ 
++// M1TRACE_REPLAY: "VBL PORT VALUE" lines (PORT: P1_A P2_A PORTC_A SERVICE12_A
++// SERVICE34_A P1_B P2_B PORTC_B SERVICE12_B SERVICE34_B ANALOG1-ANALOG8; VALUE
++// hex; '#' starts a comment). From start_of_vblank_int number VBL (counting
++// from 0), before its IRQ, the port reads VALUE (SERVICE34 bit 7 stays the
++// EEPROM). The native s32_trace reads the same file.
++static int g_s32_ov[18] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
++struct s32_replay_ev { u64 vbl; int port; int value; };
++static std::vector<s32_replay_ev> g_s32_replay;
++static size_t g_s32_replay_pos = 0;
++static u64 g_s32_vbl = 0;
++static void s32trace_replay_step()
++{
++	static bool loaded = false;
++	if (!loaded)
++	{
++		loaded = true;
++		static const char *const names[18] = { "P1_A", "P2_A", "PORTC_A", "SERVICE12_A", "SERVICE34_A", "P1_B", "P2_B", "PORTC_B", "SERVICE12_B", "SERVICE34_B",
++				"ANALOG1", "ANALOG2", "ANALOG3", "ANALOG4", "ANALOG5", "ANALOG6", "ANALOG7", "ANALOG8" };
++		if (const char *path = getenv("M1TRACE_REPLAY"))
++			if (FILE *f = fopen(path, "r"))
++			{
++				char line[256];
++				while (fgets(line, sizeof line, f))
++				{
++					unsigned long long u; char name[32]; unsigned v;
++					if (line[0] == '#' || sscanf(line, "%llu %31s %x", &u, name, &v) != 3) continue;
++					for (int i = 0; i < 18; i++)
++						if (!strcmp(name, names[i])) g_s32_replay.push_back({ u, i, int(v & 0xff) });
++				}
++				fclose(f);
++			}
++	}
++	for (; g_s32_replay_pos < g_s32_replay.size() && g_s32_replay[g_s32_replay_pos].vbl <= g_s32_vbl; g_s32_replay_pos++)
++		g_s32_ov[g_s32_replay[g_s32_replay_pos].port] = g_s32_replay[g_s32_replay_pos].value;
++	g_s32_vbl++;
++}
++
++u8 segas32_state::trace_in(int idx, const char *tag)
++{
++	ioport_port *const p = ioport(tag);
++	u8 v = p ? u8(p->read()) : 0xff;
++	if (g_s32_ov[idx] >= 0)
++		v = (idx == 4 || idx == 9) ? u8((v & 0x80) | (g_s32_ov[idx] & 0x7f)) : u8(g_s32_ov[idx]);
++	return v;
++}
++
++template <int N> ioport_value segas32_state::trace_analog()
++{
++	static const char *const tags[8] = { "ANALOG1", "ANALOG2", "ANALOG3", "ANALOG4", "ANALOG5", "ANALOG6", "ANALOG7", "ANALOG8" };
++	return g_s32_ov[10 + N] >= 0 ? ioport_value(g_s32_ov[10 + N]) : (ioport(tags[N]) ? ioport(tags[N])->read() : 0);
++}
++
+ INTERRUPT_GEN_MEMBER(segas32_state::start_of_vblank_int)
+ {
++	s32trace_replay_step();
+ 	signal_v60_irq(MAIN_IRQ_VBSTART);
+ 	system32_set_vblank(1);
+ 	m_vblank_end_int_timer->adjust(m_screen->time_until_pos(0));
+@@ -2261,15 +2314,15 @@ void segas32_state::device_add_mconfig(machine_config &config)
+ 	m_soundcpu->set_addrmap(AS_IO, &segas32_state::system32_sound_portmap);
+ 
+ 	sega_315_5296_device &io_chip(SEGA_315_5296(config, "io_chip", MAIN_CLOCK/4));
+-	io_chip.in_pa_callback().set_ioport("P1_A");
+-	io_chip.in_pb_callback().set_ioport("P2_A");
+-	io_chip.in_pc_callback().set_ioport("PORTC_A");
++	io_chip.in_pa_callback().set([this] () { return trace_in(0, "P1_A"); });
++	io_chip.in_pb_callback().set([this] () { return trace_in(1, "P2_A"); });
++	io_chip.in_pc_callback().set([this] () { return trace_in(2, "PORTC_A"); });
+ 	io_chip.out_pd_callback().set(FUNC(segas32_state::misc_output_0_w));
+ 	io_chip.out_pd_callback().append("eeprom", FUNC(eeprom_serial_93cxx_device::di_write)).bit(7);
+ 	io_chip.out_pd_callback().append("eeprom", FUNC(eeprom_serial_93cxx_device::cs_write)).bit(5);
+ 	io_chip.out_pd_callback().append("eeprom", FUNC(eeprom_serial_93cxx_device::clk_write)).bit(6);
+-	io_chip.in_pe_callback().set_ioport("SERVICE12_A");
+-	io_chip.in_pf_callback().set_ioport("SERVICE34_A");
++	io_chip.in_pe_callback().set([this] () { return trace_in(3, "SERVICE12_A"); });
++	io_chip.in_pf_callback().set([this] () { return trace_in(4, "SERVICE34_A"); });
+ 	io_chip.out_pg_callback().set(FUNC(segas32_state::sw2_output_0_w));
+ 	io_chip.out_ph_callback().set(FUNC(segas32_state::tilebank_external_w));
+ 	io_chip.out_cnt1_callback().set(FUNC(segas32_state::display_enable_w<0>));
+@@ -2333,10 +2386,10 @@ void segas32_analog_state::device_add_mconfig(machine_config &config)
+ 	m_maincpu->set_addrmap(AS_PROGRAM, &segas32_analog_state::system32_analog_map);
+ 
+ 	msm6253_device &adc(MSM6253(config, "adc"));
+-	adc.set_input_tag<0>("ANALOG1");
+-	adc.set_input_tag<1>("ANALOG2");
+-	adc.set_input_tag<2>("ANALOG3");
+-	adc.set_input_tag<3>("ANALOG4");
++	adc.set_input_cb<0>(FUNC(segas32_state::trace_analog<0>));
++	adc.set_input_cb<1>(FUNC(segas32_state::trace_analog<1>));
++	adc.set_input_cb<2>(FUNC(segas32_state::trace_analog<2>));
++	adc.set_input_cb<3>(FUNC(segas32_state::trace_analog<3>));
+ }
+ 
+ DEFINE_DEVICE_TYPE(SEGA_S32_ANALOG_DEVICE, segas32_analog_state, "segas32_pcb_analog", "Sega System 32 analog PCB")
+@@ -2561,24 +2614,24 @@ void sega_multi32_state::device_add_mconfig(machine_config &config)
+ 	m_soundcpu->set_addrmap(AS_IO, &sega_multi32_state::multi32_sound_portmap);
+ 
+ 	sega_315_5296_device &io_chip_0(SEGA_315_5296(config, "io_chip_0", MAIN_CLOCK/4));
+-	io_chip_0.in_pa_callback().set_ioport("P1_A");
+-	io_chip_0.in_pb_callback().set_ioport("P2_A");
+-	io_chip_0.in_pc_callback().set_ioport("PORTC_A");
++	io_chip_0.in_pa_callback().set([this] () { return trace_in(0, "P1_A"); });
++	io_chip_0.in_pb_callback().set([this] () { return trace_in(1, "P2_A"); });
++	io_chip_0.in_pc_callback().set([this] () { return trace_in(2, "PORTC_A"); });
+ 	io_chip_0.out_pd_callback().set(FUNC(segas32_state::misc_output_0_w));
+-	io_chip_0.in_pe_callback().set_ioport("SERVICE12_A");
+-	io_chip_0.in_pf_callback().set_ioport("SERVICE34_A");
++	io_chip_0.in_pe_callback().set([this] () { return trace_in(3, "SERVICE12_A"); });
++	io_chip_0.in_pf_callback().set([this] () { return trace_in(4, "SERVICE34_A"); });
+ 	io_chip_0.out_pg_callback().set(FUNC(segas32_state::sw2_output_0_w));
+ 	io_chip_0.out_ph_callback().set(FUNC(segas32_state::tilebank_external_w));
+ 	io_chip_0.out_cnt1_callback().set(FUNC(segas32_state::display_enable_w<0>));
+ 	io_chip_0.out_cnt2_callback().set_inputline(m_soundcpu, INPUT_LINE_RESET).invert();
+ 
+ 	sega_315_5296_device &io_chip_1(SEGA_315_5296(config, "io_chip_1", MAIN_CLOCK/4));
+-	io_chip_1.in_pa_callback().set_ioport("P1_B");
+-	io_chip_1.in_pb_callback().set_ioport("P2_B");
+-	io_chip_1.in_pc_callback().set_ioport("PORTC_B");
++	io_chip_1.in_pa_callback().set([this] () { return trace_in(5, "P1_B"); });
++	io_chip_1.in_pb_callback().set([this] () { return trace_in(6, "P2_B"); });
++	io_chip_1.in_pc_callback().set([this] () { return trace_in(7, "PORTC_B"); });
+ 	io_chip_1.out_pd_callback().set(FUNC(segas32_state::misc_output_1_w));
+-	io_chip_1.in_pe_callback().set_ioport("SERVICE12_B");
+-	io_chip_1.in_pf_callback().set_ioport("SERVICE34_B");
++	io_chip_1.in_pe_callback().set([this] () { return trace_in(8, "SERVICE12_B"); });
++	io_chip_1.in_pf_callback().set([this] () { return trace_in(9, "SERVICE34_B"); });
+ 	io_chip_1.out_pg_callback().set(FUNC(segas32_state::sw2_output_1_w));
+ 	io_chip_1.out_ph_callback().set("eeprom", FUNC(eeprom_serial_93cxx_device::di_write)).bit(7);
+ 	io_chip_1.out_ph_callback().append("eeprom", FUNC(eeprom_serial_93cxx_device::cs_write)).bit(5);
+@@ -2655,20 +2708,20 @@ void sega_multi32_analog_state::device_add_mconfig(machine_config &config)
+ 	m_maincpu->set_addrmap(AS_PROGRAM, &sega_multi32_analog_state::multi32_analog_map);
+ 
+ 	msm6253_device &adc(MSM6253(config, "adc"));
+-	adc.set_input_tag<0>("ANALOG1");
+-	adc.set_input_tag<1>("ANALOG2");
++	adc.set_input_cb<0>(FUNC(segas32_state::trace_analog<0>));
++	adc.set_input_cb<1>(FUNC(segas32_state::trace_analog<1>));
+ 	adc.set_input_cb<2>(FUNC(sega_multi32_analog_state::in2_analog_read));
+ 	adc.set_input_cb<3>(FUNC(sega_multi32_analog_state::in3_analog_read));
+ }
+ 
+ ioport_value sega_multi32_analog_state::in2_analog_read()
+ {
+-	return m_analog_ports[m_analog_bank * 4 + 2].read_safe(0);
++	return g_s32_ov[10 + m_analog_bank * 4 + 2] >= 0 ? ioport_value(g_s32_ov[10 + m_analog_bank * 4 + 2]) : m_analog_ports[m_analog_bank * 4 + 2].read_safe(0);
+ }
+ 
+ ioport_value sega_multi32_analog_state::in3_analog_read()
+ {
+-	return m_analog_ports[m_analog_bank * 4 + 3].read_safe(0);
++	return g_s32_ov[10 + m_analog_bank * 4 + 3] >= 0 ? ioport_value(g_s32_ov[10 + m_analog_bank * 4 + 3]) : m_analog_ports[m_analog_bank * 4 + 3].read_safe(0);
+ }
+ 
+ void sega_multi32_analog_state::analog_bank_w(uint8_t data)
+diff --git a/src/mame/sega/segas32.h b/src/mame/sega/segas32.h
+index e7dbed2d8e..30acf8486f 100644
+--- a/src/mame/sega/segas32.h
++++ b/src/mame/sega/segas32.h
+@@ -54,6 +54,9 @@ public:
+ 	cpu_device* maincpu() { return m_maincpu; }
+ 
+ 	uint32_t screen_update_system32(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
++	void trace_frame(bitmap_rgb32 &bitmap, const rectangle &cliprect);
++	u8 trace_in(int idx, const char *tag);
++	template <int N> ioport_value trace_analog();
+ 	uint32_t screen_update_multi32_left(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+ 	uint32_t screen_update_multi32_right(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+ 
+diff --git a/src/mame/sega/segas32_v.cpp b/src/mame/sega/segas32_v.cpp
+index 873bc5e708..b5c1b0ade3 100644
+--- a/src/mame/sega/segas32_v.cpp
++++ b/src/mame/sega/segas32_v.cpp
+@@ -2199,6 +2199,49 @@ void segas32_state::print_mixer_data(int which)
+ 	}
+ }
+ 
++// Classic 2D cores oracle (M1TRACE_FRAMES): one line per screen update of
++// screen 0: frame, V60/V70 instructions, Z80 cycles, hash of the RGB pixels
++void segas32_state::trace_frame(bitmap_rgb32 &bitmap, const rectangle &cliprect)
++{
++	{
++		static FILE *f = nullptr;
++		static bool init = false;
++		static uint64_t frame = 0;
++		if (!init)
++		{
++			init = true;
++			if (const char *p = getenv("M1TRACE_FRAMES")) f = fopen(p, "w");
++		}
++		if (f)
++		{
++			uint64_t h = 1469598103934665603ULL;
++			for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
++				for (int x = cliprect.min_x; x <= cliprect.max_x; x++)
++					h = (h ^ (bitmap.pix(y, x) & 0xffffff)) * 1099511628211ULL;
++			fprintf(f, "f %llu %llu %llu %d-%d %016llx\n", (unsigned long long)frame++, (unsigned long long)m_maincpu->trace_insn_count(),
++					(unsigned long long)m_soundcpu->total_cycles(), cliprect.min_x, cliprect.max_x, (unsigned long long)h);
++			fflush(f);
++			// M1TRACE_DUMP=DIR writes every frame as DIR/f<frame>.ppm
++			if (const char *d = getenv("M1TRACE_DUMP"))
++			{
++				char name[512];
++				snprintf(name, sizeof(name), "%s/f%llu.ppm", d, (unsigned long long)(frame - 1));
++				if (FILE *o = fopen(name, "wb"))
++				{
++					fprintf(o, "P6 %d %d 255\n", cliprect.max_x - cliprect.min_x + 1, cliprect.max_y - cliprect.min_y + 1);
++					for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
++						for (int x = cliprect.min_x; x <= cliprect.max_x; x++)
++						{
++							uint32_t c = bitmap.pix(y, x);
++							fputc((c >> 16) & 0xff, o); fputc((c >> 8) & 0xff, o); fputc(c & 0xff, o);
++						}
++					fclose(o);
++				}
++			}
++		}
++	}
++}
++
+ uint32_t segas32_state::screen_update_system32(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
+ {
+ 	uint8_t enablemask;
+@@ -2238,6 +2281,8 @@ uint32_t segas32_state::screen_update_system32(screen_device &screen, bitmap_rgb
+ 		mix_all_layers(0, 0, bitmap, cliprect, enablemask);
+ 	}
+ 
++	trace_frame(bitmap, cliprect);
++
+ 	if (LOG_SPRITES && machine().input().code_pressed(KEYCODE_L))
+ 	{
+ 		const rectangle &visarea = screen.visible_area();
+@@ -2418,6 +2463,9 @@ uint32_t segas32_state::multi32_update(screen_device &screen, bitmap_rgb32 &bitm
+ 		mix_all_layers(index, 0, bitmap, cliprect, enablemask);
+ 	}
+ 
++	if (index == 0)
++		trace_frame(bitmap, cliprect);
++
+ 	if (PRINTF_MIXER_DATA)
+ 	{
+ 		if (!screen.machine().input().code_pressed(KEYCODE_M)) print_mixer_data(0);

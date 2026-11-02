@@ -1,0 +1,8 @@
+build*/
+extern/
+roms/
+gen/
+*.rgb
+*.log
+.DS_Store
+work/

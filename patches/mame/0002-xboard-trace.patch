@@ -1,0 +1,159 @@
+diff --git a/src/mame/sega/segaxbd.cpp b/src/mame/sega/segaxbd.cpp
+index 408a8bf8c5..e0c5e828bb 100644
+--- a/src/mame/sega/segaxbd.cpp
++++ b/src/mame/sega/segaxbd.cpp
+@@ -280,6 +280,8 @@ ROMs:
+ #include "sound.h"
+ #include "speaker.h"
+ 
++#include <vector>
++
+ 
+ DEFINE_DEVICE_TYPE(SEGA_XBD_PCB, segaxbd_state, "segaxbd_pcb", "Sega X-Board PCB")
+ 
+@@ -346,7 +348,96 @@ void segaxbd_state::video_start()
+ //  VIDEO UPDATE
+ //**************************************************************************
+ 
++// X Board oracle (ORTRACE_LOG): one line per screen update with both
++// 68000s' instruction counts and hashes of the indexed and RGB screen;
++// ORTRACE_REPLAY: "UPDATE PORT VALUE" lines (PORT: io0b, io1a, io1b, io1c,
++// io1d, adc0-adc7; VALUE hex), applied after the native core's screen
++// update UPDATE (MAME's UPDATE+1). ORTRACE_FBDUMP_DIR/_EVERY dump RGB frames.
++static int g_xb_in[13] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
++struct xb_replay_ev { u64 update; int port; int value; };
++static std::vector<xb_replay_ev> g_xb_replay;
++static size_t g_xb_replay_pos = 0;
++static void xbtrace_replay_load()
++{
++	const char *path = getenv("ORTRACE_REPLAY");
++	if (!path) return;
++	FILE *f = fopen(path, "r");
++	if (!f) return;
++	static const char *const names[13] = { "io0b", "io1a", "io1b", "io1c", "io1d", "adc0", "adc1", "adc2", "adc3", "adc4", "adc5", "adc6", "adc7" };
++	char line[256];
++	while (fgets(line, sizeof line, f))
++	{
++		unsigned long long u; char name[32]; unsigned v;
++		if (line[0] == '#' || sscanf(line, "%llu %31s %x", &u, name, &v) != 3) continue;
++		for (int i = 0; i < 13; i++)
++			if (!strcmp(name, names[i])) g_xb_replay.push_back({ u, i, int(v & 0xff) });
++	}
++	fclose(f);
++}
++
++static void xbtrace_frame(m68000_device &main, m68000_device &sub, z80_device &snd, palette_device &palette, bitmap_ind16 &bitmap, const rectangle &clip)
++{
++	// ORTRACE_HASH_CLIP: hash only the rows this update drew (MAME alternates
++	// two screen bitmaps, so the other rows hold an older frame)
++	static const bool hash_clip = getenv("ORTRACE_HASH_CLIP") != nullptr;
++	static u64 frame = 0;
++	static bool init = false;
++	static const char *dir = nullptr;
++	static u64 every = 1;
++	if (!init)
++	{
++		init = true;
++		dir = getenv("ORTRACE_FBDUMP_DIR");
++		if (const char *e = getenv("ORTRACE_FBDUMP_EVERY")) every = strtoull(e, nullptr, 10);
++		if (!every) every = 1;
++		xbtrace_replay_load();
++	}
++	if (g_ortrace_log || dir)
++	{
++		u64 hi = 1469598103934665603ULL, hr = 1469598103934665603ULL;
++		std::vector<u8> rgb;
++		if (dir && !(frame % every)) rgb.reserve(320 * 224 * 3);
++		for (int y = 0; y < 224; y++)
++		{
++			const bool hash_row = !hash_clip || (y >= clip.min_y && y <= clip.max_y);
++			u16 const *row = &bitmap.pix(y);
++			for (int x = 0; x < 320; x++)
++			{
++				rgb_t const c = palette.pen_color(row[x]);
++				if (hash_row)
++				{
++					hi = (hi ^ row[x]) * 1099511628211ULL;
++					hr = (hr ^ (c & 0xffffff)) * 1099511628211ULL;
++				}
++				if (dir && !(frame % every)) { rgb.push_back(c.r()); rgb.push_back(c.g()); rgb.push_back(c.b()); }
++			}
++		}
++		if (g_ortrace_log)
++			fprintf(g_ortrace_log, "f %llu %llu %llu %llu %016llx %016llx\n", (unsigned long long)frame, (unsigned long long)main.or_insn(),
++					(unsigned long long)sub.or_insn(), (unsigned long long)snd.total_cycles(), (unsigned long long)hi, (unsigned long long)hr);
++		if (dir && !(frame % every))
++		{
++			char path[1024];
++			snprintf(path, sizeof path, "%s/f%06llu.rgb", dir, (unsigned long long)frame);
++			if (FILE *f = fopen(path, "wb")) { fwrite(rgb.data(), 1, rgb.size(), f); fclose(f); }
++		}
++	}
++	while (g_xb_replay_pos < g_xb_replay.size() && g_xb_replay[g_xb_replay_pos].update + 1 <= frame)
++	{
++		g_xb_in[g_xb_replay[g_xb_replay_pos].port] = g_xb_replay[g_xb_replay_pos].value;
++		g_xb_replay_pos++;
++	}
++	frame++;
++}
++
+ uint32_t segaxbd_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
++{
++	uint32_t const r = screen_update_draw(screen, bitmap, cliprect);
++	xbtrace_frame(*m_maincpu, *m_subcpu, *m_soundcpu, *m_palette, bitmap, cliprect);
++	return r;
++}
++
++uint32_t segaxbd_state::screen_update_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
+ {
+ 	// if no drawing is happening, fill with black and get out
+ 	if (!m_segaic16vid->m_display_enable)
+@@ -428,6 +519,7 @@ void segaxbd_state::device_start()
+ 
+ 	// allocate a scanline timer
+ 	m_scanline_timer = timer_alloc(FUNC(segaxbd_state::scanline_tick), this);
++	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () { ortrace_write_pcs(); }));
+ 
+ 	// save state
+ 	save_item(NAME(m_timer_irq_state));
+@@ -573,6 +665,7 @@ uint8_t segaxbd_state::analog_r()
+ 	// on the write, latch the selected input port and stash the value
+ 	const int which = (m_pc_0 >> 2) & 7;
+ 	uint8_t value = m_adc_ports[which].read_safe(0x10);
++	if (g_xb_in[5 + which] >= 0) value = g_xb_in[5 + which];
+ 
+ 	// reverse some port values
+ 	if (m_adc_reverse[which])
+@@ -1821,15 +1914,15 @@ void segaxbd_state::xboard_base_mconfig(machine_config &config)
+ 
+ 	CXD1095(config, m_iochip[0]); // IC160
+ 	m_iochip[0]->in_porta_cb().set_ioport("IO0PORTA");
+-	m_iochip[0]->in_portb_cb().set_ioport("IO0PORTB");
++	m_iochip[0]->in_portb_cb().set([this] () -> u8 { return g_xb_in[0] >= 0 ? u8(g_xb_in[0]) : u8(ioport("IO0PORTB")->read()); });
+ 	m_iochip[0]->out_portc_cb().set(FUNC(segaxbd_state::pc_0_w));
+ 	m_iochip[0]->out_portd_cb().set(FUNC(segaxbd_state::pd_0_w));
+ 
+ 	CXD1095(config, m_iochip[1]); // IC159
+-	m_iochip[1]->in_porta_cb().set_ioport("IO1PORTA");
+-	m_iochip[1]->in_portb_cb().set_ioport("IO1PORTB");
+-	m_iochip[1]->in_portc_cb().set_ioport("IO1PORTC");
+-	m_iochip[1]->in_portd_cb().set_ioport("IO1PORTD");
++	m_iochip[1]->in_porta_cb().set([this] () -> u8 { return g_xb_in[1] >= 0 ? u8(g_xb_in[1]) : u8(ioport("IO1PORTA")->read()); });
++	m_iochip[1]->in_portb_cb().set([this] () -> u8 { return g_xb_in[2] >= 0 ? u8(g_xb_in[2]) : u8(ioport("IO1PORTB")->read()); });
++	m_iochip[1]->in_portc_cb().set([this] () -> u8 { return g_xb_in[3] >= 0 ? u8(g_xb_in[3]) : u8(ioport("IO1PORTC")->read()); });
++	m_iochip[1]->in_portd_cb().set([this] () -> u8 { return g_xb_in[4] >= 0 ? u8(g_xb_in[4]) : u8(ioport("IO1PORTD")->read()); });
+ 
+ 	adc0804_device &adc(ADC0804(config, "adc", MASTER_CLOCK/4/10)); // uses E clock from main CPU
+ 	adc.vin_callback().set(FUNC(segaxbd_state::analog_r));
+diff --git a/src/mame/sega/segaxbd.h b/src/mame/sega/segaxbd.h
+index 5300601059..2f9d1a6923 100644
+--- a/src/mame/sega/segaxbd.h
++++ b/src/mame/sega/segaxbd.h
+@@ -65,6 +65,7 @@ protected:
+ 
+ 	// video updates
+ 	uint32_t screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
++	uint32_t screen_update_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+ 
+ 	// palette helpers
+ 	void paletteram_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);

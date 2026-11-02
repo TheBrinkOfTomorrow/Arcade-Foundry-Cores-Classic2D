@@ -1,0 +1,477 @@
+diff --git a/src/devices/cpu/m68000/m68000.cpp b/src/devices/cpu/m68000/m68000.cpp
+index 847703ecd0..b49c1867f5 100644
+--- a/src/devices/cpu/m68000/m68000.cpp
++++ b/src/devices/cpu/m68000/m68000.cpp
+@@ -3,6 +3,9 @@
+ 
+ #include "emu.h"
+ #include "m68000.h"
++
++#include <set>
++#include <string>
+ #include "m68kdasm.h"
+ 
+ DEFINE_DEVICE_TYPE(M68000,      m68000_device,      "m68000",       "Motorola MC68000")
+@@ -144,6 +147,50 @@ u16 m68000_device::get_fc() const noexcept
+ 	return (m_base_ssw | (m_sr & SR_S ? SSW_S : 0)) & 7;
+ }
+ 
++u64 g_m2snd_insn = 0;
++FILE *g_m2snd_log = nullptr;
++static const void *g_m2snd_cpu = nullptr;
++static bool g_m2snd_snap = true;
++
++// Out Run board oracle (ORTRACE_LOG): per-CPU instruction counts, interrupts
++// and register snapshots for the main and sub 68000s.
++FILE *g_ortrace_log = nullptr;
++static bool g_ortrace_tried = false;
++static std::set<u32> g_ortrace_pcs[2];
++static const char *g_ortrace_pcs_path = nullptr;
++static u64 g_ortrace_mask = 4095, g_ortrace_dense_from = 0, g_ortrace_dense_to = 0;
++
++int m68000_device::ortrace_id() const
++{
++	if(!g_ortrace_tried) {
++		g_ortrace_tried = true;
++		if(const char *p = getenv("ORTRACE_LOG")) { const char *q = getenv("ORTRACE_SCHED"); const bool shared = q && !strcmp(p, q); g_ortrace_log = fopen(p, shared ? "a" : "w"); if(shared && g_ortrace_log) setvbuf(g_ortrace_log, nullptr, _IONBF, 0); }
++		g_ortrace_pcs_path = getenv("ORTRACE_PCS");
++		if(const char *e = getenv("ORTRACE_EVERY")) g_ortrace_mask = strtoull(e, nullptr, 10) - 1; // a power of two
++		if(const char *e = getenv("ORTRACE_DENSE")) sscanf(e, "%llu:%llu", (unsigned long long *)&g_ortrace_dense_from, (unsigned long long *)&g_ortrace_dense_to); // every instruction in [from, to)
++	}
++	const std::string t(tag());
++	if(t == ":maincpu" || t == ":mainpcb:maincpu") return 0;
++	if(t == ":subcpu" || t == ":mainpcb:subcpu") return 1;
++	return -1;
++}
++
++void ortrace_write_pcs()
++{
++	if(!g_ortrace_pcs_path) return;
++	for(int c = 0; c < 2; c++) {
++		std::string p = std::string(g_ortrace_pcs_path) + (c ? ".sub" : ".main");
++		if(FILE *f = fopen(p.c_str(), "w")) {
++			// "PC" or, for an FD1094, "PC STATE" (the state the opcode was decrypted in)
++			for(u32 a : g_ortrace_pcs[c]) {
++				if(a >> 24) fprintf(f, "%06x %02x\n", a & 0xffffff, (a >> 24) - 1);
++				else fprintf(f, "%06x\n", a);
++			}
++			fclose(f);
++		}
++	}
++}
++
+ void m68000_device::execute_run()
+ {
+ 	m_icount -= m_count_before_instruction_step;
+@@ -158,13 +205,57 @@ void m68000_device::execute_run()
+ 			(this->*(m_handlers_p[m_inst_state]))();
+ 
+ 		while(m_icount > 0) {
++			if(g_m2snd_log && g_m2snd_cpu == this && m_inst_state == S_INTERRUPT) {
++				fprintf(g_m2snd_log, "i %llu %u\n", (unsigned long long)g_m2snd_insn, m_int_level);
++				g_m2snd_snap = true;
++			}
+ 			if(m_inst_state >= S_first_instruction) {
+ 				m_ipc = m_pc - 2;
+ 				m_irdi = m_ird;
++				if(g_m2snd_log && g_m2snd_cpu == this) {
++					if(g_m2snd_snap || !(g_m2snd_insn & 4095)) {
++						fprintf(g_m2snd_log, "s %llu %06x %04x", (unsigned long long)g_m2snd_insn, m_ipc, m_sr);
++						for(int i = 0; i < 15; i++)
++							fprintf(g_m2snd_log, " %08x", m_da[i]);
++						fprintf(g_m2snd_log, " %08x %08x\n", m_da[m_sp], m_da[m_sp == 15 ? 16 : 15]);
++						g_m2snd_snap = false;
++					}
++					g_m2snd_insn++;
++				}
++
++				if(m_or_id >= 0) {
++					if(g_ortrace_log && m_or_prev_valid && m_or_insn >= g_ortrace_dense_from && m_or_insn < g_ortrace_dense_to) {
++						const u64 now = total_cycles();
++						fprintf(g_ortrace_log, "y%d %06x %lld %lld %lld\n", m_or_id, m_or_prev_pc, (long long)(now - m_or_prev_start),
++								m_or_y_total ? (long long)(now - m_or_y_total) : -1LL, m_or_first_data ? (long long)(m_or_first_data - 1 - m_or_prev_start) : -1LL);
++					}
++					m_or_prev_valid = true;
++					m_or_prev_start = total_cycles();
++					m_or_prev_pc = m_ipc;
++					m_or_first_data = 0;
++					m_or_y_total = 0;
++					if(g_ortrace_log && (m_or_snap || !(m_or_insn & g_ortrace_mask) || (m_or_insn >= g_ortrace_dense_from && m_or_insn < g_ortrace_dense_to))) {
++						fprintf(g_ortrace_log, "s%d %llu %llu %06x %04x", m_or_id, (unsigned long long)m_or_insn, (unsigned long long)total_cycles(), m_ipc, m_sr);
++						for(int i = 0; i < 15; i++)
++							fprintf(g_ortrace_log, " %08x", m_da[i]);
++						fprintf(g_ortrace_log, " %08x %08x\n", m_da[m_sp], m_da[m_sp == 15 ? 16 : 15]);
++						m_or_snap = false;
++					}
++					if(g_ortrace_pcs_path) {
++						const int st = ortrace_opstate();
++						g_ortrace_pcs[m_or_id].insert((m_ipc & 0xffffff) | (st >= 0 ? u32(st + 1) << 24 : 0));
++					}
++					m_or_insn++;
++				}
+ 
+ 				if(debugger_enabled())
+ 					debugger_instruction_hook(m_ipc);
+ 			}
++			if(m_or_id >= 0 && m_inst_state == S_INTERRUPT) {
++				m_or_prev_valid = false;
++				if(g_ortrace_log) fprintf(g_ortrace_log, "i%d %llu %llu %u\n", m_or_id, (unsigned long long)m_or_insn, (unsigned long long)total_cycles(), m_int_level);
++				m_or_snap = true;
++			}
+ 			(this->*(m_handlers_f[m_inst_state]))();
+ 		}
+ 
+@@ -221,6 +312,12 @@ void m68000_device::default_autovectors_map(address_map &map)
+ void m68000_device::device_start()
+ {
+ 	init_decode_table();
++	m_or_id = ortrace_id();
++
++	if(const char *path = getenv("M2TRACE_SNDLOG"); path && !g_m2snd_log && (std::string(tag()).find("sndcpu") != std::string::npos || std::string(tag()).find("audiocpu") != std::string::npos)) {
++		g_m2snd_log = fopen(path, "w");
++		g_m2snd_cpu = this;
++	}
+ 
+ 	m_cmpild_instr_callback.resolve();
+ 	m_rte_instr_callback.resolve();
+diff --git a/src/devices/cpu/m68000/m68000.h b/src/devices/cpu/m68000/m68000.h
+index 6f067a6ba7..0fbb150c49 100644
+--- a/src/devices/cpu/m68000/m68000.h
++++ b/src/devices/cpu/m68000/m68000.h
+@@ -7,6 +7,16 @@
+ 
+ #include "m68kcommon.h"
+ 
++#include <cstdio>
++
++// daytona-arcade-recomp oracle (M2TRACE_SNDLOG): the sound 68000's instruction
++// count and log, shared with the sound board's device handlers.
++extern u64 g_m2snd_insn;
++extern FILE *g_m2snd_log;
++// Out Run board oracle (ORTRACE_LOG / ORTRACE_PCS).
++extern FILE *g_ortrace_log;
++void ortrace_write_pcs();
++
+ class m68000_device : public m68000_base_device
+ {
+ public:
+@@ -171,6 +181,20 @@ protected:
+ 
+ 	u32 m_da[17]; // 8 data, 7 address, usp, ssp in that order
+ 	u32 m_ipc, m_pc, m_au, m_at, m_aob, m_dt, m_int_vector;
++
++	// Out Run board oracle
++	int m_or_id = -1;
++	bool m_or_snap = true;
++	u64 m_or_insn = 0;
++	u64 m_or_acc_total = 0, m_or_y_total = 0, m_or_first_data = 0, m_or_prev_start = 0;
++	u32 m_or_prev_pc = 0;
++	bool m_or_prev_valid = false;
++	int ortrace_id() const;
++	// the opcode decryption state (FD1094), or -1
++	virtual int ortrace_opstate() const { return -1; }
++public:
++	u64 or_insn() const { return m_or_insn; }
++protected:
+ 	u32 m_sp;     // 15 or 16, index of currently active sp
+ 	int m_icount, m_bcount, m_count_before_instruction_step, m_t;
+ 	u32 m_movems;
+diff --git a/src/devices/cpu/z80/z80.cpp b/src/devices/cpu/z80/z80.cpp
+index d763e6614a..16edfd9bbd 100644
+--- a/src/devices/cpu/z80/z80.cpp
++++ b/src/devices/cpu/z80/z80.cpp
+@@ -28,6 +28,7 @@ TODO:
+ #include "z80.inc"
+ 
+ #include <cstdio>
++#include <string>
+ 
+ #define LOG_INT   (1U << 1) // z80.lst
+ #define LOG_UNDOC (1U << 2)
+@@ -780,9 +781,38 @@ void z80_device::device_reset()
+ /****************************************************************************
+  * Execute 'cycles' T-states.
+  ****************************************************************************/
++// Classic 2D cores oracle (ORTRACE_LOG): Z80 register snapshots for the
++// sound CPU, "s2 <insn> <cycles> <pc> <af> <bc> <de> <hl> <ix> <iy> <sp>",
++// every ORTRACE_ZEVERY instructions and every one in ORTRACE_ZDENSE.
++// defined in m68000.cpp; weak here so builds without the 68000 link (System 32)
++__attribute__((weak)) FILE *g_ortrace_log = nullptr;
++static u64 g_orz_insn = 0, g_orz_mask = 4095, g_orz_from = 0, g_orz_to = 0;
++static int g_orz_init = 0;
++void z80_device::ortrace_hook(u16 pc)
++{
++	if (!m_or_checked)
++	{
++		m_or_checked = true;
++		m_or_is = std::string(tag()) == ":soundcpu" || std::string(tag()) == ":mainpcb:soundcpu";
++	}
++	if (!m_or_is) return;
++	if (!g_orz_init)
++	{
++		g_orz_init = 1;
++		if (const char *e = getenv("ORTRACE_ZEVERY")) g_orz_mask = strtoull(e, nullptr, 10) - 1;
++		if (const char *e = getenv("ORTRACE_ZDENSE")) sscanf(e, "%llu:%llu", (unsigned long long *)&g_orz_from, (unsigned long long *)&g_orz_to);
++	}
++	if (g_ortrace_log && (!(g_orz_insn & g_orz_mask) || (g_orz_insn >= g_orz_from && g_orz_insn < g_orz_to)))
++		fprintf(g_ortrace_log, "s2 %llu %llu %04x %04x %04x %04x %04x %04x %04x %04x\n", (unsigned long long)g_orz_insn, (unsigned long long)total_cycles(),
++				pc, (A << 8) | get_f(), BC, DE, HL, IX, IY, SP);
++	g_orz_insn++;
++}
++
+ void z80_device::execute_run()
+ {
++	#define debugger_instruction_hook(pc) do { ortrace_hook(pc); device_execute_interface::debugger_instruction_hook(pc); } while (0)
+ 	#include "cpu/z80/z80.hxx"
++	#undef debugger_instruction_hook
+ }
+ 
+ void z80_device::execute_set_input(int inputnum, int state)
+diff --git a/src/devices/cpu/z80/z80.h b/src/devices/cpu/z80/z80.h
+index 004b7799cd..682540d731 100644
+--- a/src/devices/cpu/z80/z80.h
++++ b/src/devices/cpu/z80/z80.h
+@@ -65,6 +65,8 @@ protected:
+ 	virtual u32 execute_default_irq_vector(int inputnum) const noexcept override { return 0xff; }
+ 	virtual bool execute_input_edge_triggered(int inputnum) const noexcept override { return inputnum == INPUT_LINE_NMI; }
+ 	virtual void execute_run() override;
++	void ortrace_hook(u16 pc);
++	bool m_or_checked = false, m_or_is = false;
+ 	virtual void execute_set_input(int inputnum, int state) override;
+ 
+ 	// device_memory_interface implementation
+diff --git a/src/emu/schedule.cpp b/src/emu/schedule.cpp
+index a475fd9b51..58f7cf01ed 100644
+--- a/src/emu/schedule.cpp
++++ b/src/emu/schedule.cpp
+@@ -390,8 +390,29 @@ inline void device_scheduler::apply_suspend_changes()
+ //  timeslice
+ //-------------------------------------------------
+ 
++// Classic 2D cores oracle (ORTRACE_SCHED): every timeslice target, every
++// CPU's run and every timer callback, up to ORTRACE_SCHED_MAX lines.
++static FILE *g_ortrace_sched = nullptr;
++static unsigned long long g_ortrace_sched_left = 0;
++static bool g_ortrace_sched_init = false;
++static double g_ortrace_sched_from = 0;
++static bool g_ortrace_sched_on = true;
++static void ortrace_sched_open()
++{
++	g_ortrace_sched_init = true;
++	if (const char *p = getenv("ORTRACE_SCHED"))
++	{
++		{ const char *l = getenv("ORTRACE_LOG"); const bool shared = l && !strcmp(l, p); g_ortrace_sched = fopen(p, shared ? "a" : "w"); if (shared && g_ortrace_sched) setvbuf(g_ortrace_sched, nullptr, _IONBF, 0); }
++		g_ortrace_sched_left = 2000000;
++		if (const char *m = getenv("ORTRACE_SCHED_MAX")) g_ortrace_sched_left = strtoull(m, nullptr, 10);
++		if (const char *f = getenv("ORTRACE_SCHED_FROM")) { g_ortrace_sched_from = strtod(f, nullptr); g_ortrace_sched_on = false; }
++	}
++}
++#define ORSCHED(...) do { if (g_ortrace_sched && g_ortrace_sched_on && g_ortrace_sched_left) { g_ortrace_sched_left--; fprintf(g_ortrace_sched, __VA_ARGS__); } } while (0)
++
+ void device_scheduler::timeslice()
+ {
++	if (!g_ortrace_sched_init) ortrace_sched_open();
+ 	bool call_debugger = ((machine().debug_flags & DEBUG_FLAG_ENABLED) != 0);
+ 
+ 	// build the execution list if we don't have one yet
+@@ -414,6 +435,8 @@ void device_scheduler::timeslice()
+ 
+ 		LOG("------------------\n");
+ 		LOG("cpu_timeslice: target = %s\n", target.as_string(PRECISION));
++		if (!g_ortrace_sched_on && target.as_double() >= g_ortrace_sched_from) g_ortrace_sched_on = true;
++		ORSCHED("t %d.%018lld\n", target.seconds(), (long long)target.attoseconds());
+ 
+ 		// do we have pending suspension changes?
+ 		if (m_suspend_changes_pending)
+@@ -471,6 +494,7 @@ void device_scheduler::timeslice()
+ 
+ 					// account for these cycles
+ 					exec->m_totalcycles += ran;
++					ORSCHED("r %s %d %d\n", exec->device().tag(), exec->m_cycles_running, ran);
+ 
+ 					// update the local time for this CPU
+ 					attotime deltatime;
+@@ -956,6 +980,7 @@ inline void device_scheduler::execute_timers()
+ 			if (!timer.m_callback.isnull())
+ 			{
+ 				LOG("execute_timers: timer callback %s\n", timer.m_callback.name());
++				ORSCHED("T %s %d.%018lld %d\n", timer.m_callback.name() ? timer.m_callback.name() : "?", timer.m_expire.seconds(), (long long)timer.m_expire.attoseconds(), timer.m_param);
+ 				timer.m_callback(timer.m_param);
+ 			}
+ 		}
+diff --git a/src/mame/sega/fd1094.h b/src/mame/sega/fd1094.h
+index 65539e7320..ad803b0e3f 100644
+--- a/src/mame/sega/fd1094.h
++++ b/src/mame/sega/fd1094.h
+@@ -86,6 +86,7 @@ public:
+ 
+ 	void decrypted_opcodes_map(address_map &map) ATTR_COLD;
+ protected:
++	virtual int ortrace_opstate() const override { return state(); }
+ 	required_memory_bank m_decrypted_opcodes_bank;
+ 
+ 	// device overrides
+diff --git a/src/mame/sega/segaorun.cpp b/src/mame/sega/segaorun.cpp
+index 4b498fe493..d6235dc7c6 100644
+--- a/src/mame/sega/segaorun.cpp
++++ b/src/mame/sega/segaorun.cpp
+@@ -297,6 +297,8 @@ Notes:
+ #include "sound/ymopm.h"
+ 
+ #include "screen.h"
++
++#include <vector>
+ #include "sound.h"
+ #include "speaker.h"
+ 
+@@ -387,7 +389,9 @@ private:
+ 
+ 	// video updates
+ 	uint32_t screen_update_outrun(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
++	uint32_t screen_update_outrun_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+ 	uint32_t screen_update_shangon(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
++	uint32_t screen_update_shangon_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+ 
+ 	void tileram_w(address_space &space, offs_t offset, uint16_t data, uint16_t mem_mask = ~0) { m_segaic16vid->tileram_w(offset,data,mem_mask); }
+ 	void textram_w(address_space &space, offs_t offset, uint16_t data, uint16_t mem_mask = ~0) { m_segaic16vid->textram_w(offset,data,mem_mask); }
+@@ -492,7 +496,7 @@ void segaorun_state::video_start()
+ //  VIDEO UPDATE
+ //**************************************************************************
+ 
+-uint32_t segaorun_state::screen_update_shangon(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
++uint32_t segaorun_state::screen_update_shangon_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
+ {
+ 	// start the sprites drawing
+ 	m_sprites->draw_async(cliprect);
+@@ -557,7 +561,99 @@ uint32_t segaorun_state::screen_update_shangon(screen_device &screen, bitmap_ind
+ 	return 0;
+ }
+ 
++// Out Run board oracle (ORTRACE_LOG): one line per screen update with both
++// 68000s' instruction counts and hashes of the indexed and RGB screen;
++// ORTRACE_REPLAY: a text file of "UPDATE PORT VALUE" lines (PORT: service,
++// unknown, coinage, dsw, adc0, adc1, adc2; VALUE hex). After the native
++// core's screen update UPDATE (MAME's UPDATE+1, which counts an extra
++// power-on update) the port reads VALUE from then on.
++static int g_or_in[7] = { -1, -1, -1, -1, -1, -1, -1 };
++struct or_replay_ev { u64 update; int port; int value; };
++static std::vector<or_replay_ev> g_or_replay;
++static size_t g_or_replay_pos = 0;
++static void ortrace_replay_load()
++{
++	const char *path = getenv("ORTRACE_REPLAY");
++	if (!path) return;
++	FILE *f = fopen(path, "r");
++	if (!f) return;
++	static const char *const names[7] = { "service", "unknown", "coinage", "dsw", "adc0", "adc1", "adc2" };
++	char line[256];
++	while (fgets(line, sizeof line, f))
++	{
++		unsigned long long u; char name[32]; unsigned v;
++		if (line[0] == '#' || sscanf(line, "%llu %31s %x", &u, name, &v) != 3) continue;
++		for (int i = 0; i < 7; i++)
++			if (!strcmp(name, names[i])) g_or_replay.push_back({ u, i, int(v & 0xff) });
++	}
++	fclose(f);
++}
++
++// ORTRACE_FBDUMP_DIR / ORTRACE_FBDUMP_EVERY dump raw RGB frames.
++static void ortrace_frame(running_machine &machine, m68000_device &main, m68000_device &sub, z80_device &snd, palette_device &palette, bitmap_ind16 &bitmap)
++{
++	static u64 frame = 0;
++	static bool init = false;
++	static const char *dir = nullptr;
++	static u64 every = 1;
++	if (!init)
++	{
++		init = true;
++		dir = getenv("ORTRACE_FBDUMP_DIR");
++		if (const char *e = getenv("ORTRACE_FBDUMP_EVERY")) every = strtoull(e, nullptr, 10);
++		if (!every) every = 1;
++		ortrace_replay_load();
++	}
++	if (g_ortrace_log || dir)
++	{
++		u64 hi = 1469598103934665603ULL, hr = 1469598103934665603ULL;
++		std::vector<u8> rgb;
++		if (dir && !(frame % every)) rgb.reserve(320 * 224 * 3);
++		
++		for (int y = 0; y < 224; y++)
++		{
++			u16 const *row = &bitmap.pix(y);
++			for (int x = 0; x < 320; x++)
++			{
++				hi = (hi ^ row[x]) * 1099511628211ULL;
++				rgb_t const c = palette.pen_color(row[x]);
++				hr = (hr ^ (c & 0xffffff)) * 1099511628211ULL;
++				if (dir && !(frame % every)) { rgb.push_back(c.r()); rgb.push_back(c.g()); rgb.push_back(c.b()); }
++			}
++		}
++		if (g_ortrace_log)
++			fprintf(g_ortrace_log, "f %llu %llu %llu %llu %016llx %016llx\n", (unsigned long long)frame, (unsigned long long)main.or_insn(),
++					(unsigned long long)sub.or_insn(), (unsigned long long)snd.total_cycles(), (unsigned long long)hi, (unsigned long long)hr);
++		if (dir && !(frame % every))
++		{
++			char path[1024];
++			snprintf(path, sizeof path, "%s/f%06llu.rgb", dir, (unsigned long long)frame);
++			if (FILE *f = fopen(path, "wb")) { fwrite(rgb.data(), 1, rgb.size(), f); fclose(f); }
++		}
++	}
++	while (g_or_replay_pos < g_or_replay.size() && g_or_replay[g_or_replay_pos].update + 1 <= frame)
++	{
++		g_or_in[g_or_replay[g_or_replay_pos].port] = g_or_replay[g_or_replay_pos].value;
++		g_or_replay_pos++;
++	}
++	frame++;
++}
++
++uint32_t segaorun_state::screen_update_shangon(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
++{
++	uint32_t const r = screen_update_shangon_draw(screen, bitmap, cliprect);
++	ortrace_frame(machine(), *m_maincpu, *m_subcpu, *m_soundcpu, *m_palette, bitmap);
++	return r;
++}
++
+ uint32_t segaorun_state::screen_update_outrun(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
++{
++	uint32_t const r = screen_update_outrun_draw(screen, bitmap, cliprect);
++	ortrace_frame(machine(), *m_maincpu, *m_subcpu, *m_soundcpu, *m_palette, bitmap);
++	return r;
++}
++
++uint32_t segaorun_state::screen_update_outrun_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
+ {
+ 	// if no drawing is happening, fill with black and get out
+ 	if (!m_segaic16vid->m_display_enable)
+@@ -865,6 +961,7 @@ void segaorun_state::nop_w(address_space &space, offs_t offset, uint16_t data, u
+ 
+ void segaorun_state::machine_start()
+ {
++	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () { ortrace_write_pcs(); }));
+ }
+ 
+ //-------------------------------------------------
+@@ -980,6 +1077,7 @@ uint16_t segaorun_state::outrun_custom_io_r(address_space &space, offs_t offset)
+ 
+ 		case 0x10/2:
+ 		{
++			if (g_or_in[offset & 3] >= 0) return g_or_in[offset & 3];
+ 			return m_digital_ports[offset & 3]->read();
+ 		}
+ 
+@@ -1064,6 +1162,7 @@ uint16_t segaorun_state::shangon_custom_io_r(address_space &space, offs_t offset
+ 		case 0x1004/2:
+ 		case 0x1006/2:
+ 		{
++			if (g_or_in[offset & 3] >= 0) return g_or_in[offset & 3];
+ 			return m_digital_ports[offset & 3]->read();
+ 		}
+ 
+@@ -1136,6 +1235,7 @@ void segaorun_state::shangon_custom_io_w(offs_t offset, uint16_t data, uint16_t
+ 
+ uint8_t segaorun_state::analog_r()
+ {
++	if (m_adc_select < 3 && g_or_in[4 + m_adc_select] >= 0) return g_or_in[4 + m_adc_select];
+ 	return m_adc_ports[m_adc_select].read_safe(0x10);
+ }
+ 

@@ -1,0 +1,38 @@
+# Debug aids for the 68000 boards on top of 0001-0003: ORTRACE_WATCH=OFFSET:INSN
+# (the X Board shared sub RAM word at OFFSET, printed by the main CPU on
+# each change, as xbd_trace ORUN_WATCH) and each CPU's total cycles on
+# the ORTRACE_SCHED "r" lines.
+
+--- a/src/devices/cpu/m68000/m68000.cpp	2026-11-01 21:54:59.251266756 +0000
++++ b/src/devices/cpu/m68000/m68000.cpp	2026-11-01 21:54:59.253030330 +0000
+@@ -241,6 +241,19 @@
+ 						fprintf(g_ortrace_log, " %08x %08x\n", m_da[m_sp], m_da[m_sp == 15 ? 16 : 15]);
+ 						m_or_snap = false;
+ 					}
++					// ORTRACE_WATCH=OFFSET:INSN (hex offset into the X Board's shared
++					// sub RAM, as xbd_trace's ORUN_WATCH): from the main CPU's
++					// instruction INSN on, print "w 0 INSNS CYC PC OLD NEW" when the
++					// word there has changed
++					if(m_or_id == 0) {
++						static int w_init = 0; static u32 w_addr = 0; static u64 w_from = ~0ULL; static u16 w_val = 0;
++						if(!w_init) { w_init = 1; if(const char *w = getenv("ORTRACE_WATCH")) { const unsigned long o = strtoul(w, nullptr, 16); w_addr = (o & 0x4000 ? 0x2a0000 : 0x280000) + (o & 0x3ffe); if(const char *c = strchr(w, ':')) w_from = strtoull(c + 1, nullptr, 10); else w_from = 0; w_init = 2; } }
++						if(w_init == 2 && m_or_insn >= w_from && g_ortrace_log) {
++							const u16 v = space(AS_PROGRAM).read_word(w_addr);
++							if(v != w_val) fprintf(g_ortrace_log, "w 0 %llu %llu %06x %04x %04x\n", (unsigned long long)m_or_insn, (unsigned long long)total_cycles(), m_ipc, w_val, v);
++							w_val = v;
++						}
++					}
+ 					if(g_ortrace_pcs_path) {
+ 						const int st = ortrace_opstate();
+ 						g_ortrace_pcs[m_or_id].insert((m_ipc & 0xffffff) | (st >= 0 ? u32(st + 1) << 24 : 0));
+--- a/src/emu/schedule.cpp	2026-11-01 21:54:59.247808716 +0000
++++ b/src/emu/schedule.cpp	2026-11-01 21:54:59.249600887 +0000
+@@ -494,7 +494,7 @@
+ 
+ 					// account for these cycles
+ 					exec->m_totalcycles += ran;
+-					ORSCHED("r %s %d %d\n", exec->device().tag(), exec->m_cycles_running, ran);
++					ORSCHED("r %s %d %d %llu\n", exec->device().tag(), exec->m_cycles_running, ran, (unsigned long long)exec->total_cycles());
+ 
+ 					// update the local time for this CPU
+ 					attotime deltatime;
