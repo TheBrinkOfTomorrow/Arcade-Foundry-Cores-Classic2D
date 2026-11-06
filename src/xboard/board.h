@@ -27,14 +27,24 @@ using orun::Video;
 using sched::attoseconds_t;
 using sched::attotime;
 
-// Which game (MAME's aburner2, thndrbld with an FD1094 main CPU, and the
-// unprotected thndrbld1).
-enum class Game : uint8_t { aburner2, thndrbld, thndrbld1 };
+// Which game (MAME's aburner2, thndrbld with an FD1094 main CPU, the
+// unprotected thndrbld1, the original After Burner's aburner131, and
+// Racing Hero's rachero, FD1094 317-0144, and Super Monaco GP's smgp,
+// FD1094 317-0126a, with its second sound board, and Line of Fire's
+// loffire, FD1094 317-0136, two gun turrets, and GP Rider's gprider, FD1094
+// 317-0163, one board of the twin set: MAME's gpriders).
+enum class Game : uint8_t { aburner2, thndrbld, thndrbld1, aburner131, rachero, smgp, loffire, gprider };
+
+// After Burner and After Burner II share MAME's sega_aburner2 config and
+// init_aburner2 (motor port, no road priority, the same ADCs).
+inline bool is_aburner(Game g) { return g == Game::aburner2 || g == Game::aburner131; }
 
 struct Roms {
     std::vector<uint8_t> main, sub; // 0x80000 each, big-endian words
     std::vector<uint8_t> sound;     // Z80 program (0x10000)
     std::vector<uint8_t> pcm;       // 315-5218 samples (0x80000, as MAME loads them)
+    // Super Monaco GP's extra sound board (soundcpu2, pcm2); empty otherwise
+    std::vector<uint8_t> sound2, pcm2;
     orun::VideoRoms video;          // tiles, sprites (0x200000), road (empty: no rendering)
     Game game = Game::aburner2;
     std::vector<uint8_t> fd1094_key; // 0x2000 bytes: the main CPU is an FD1094 (thndrbld)
@@ -52,7 +62,35 @@ struct Inputs {
     uint8_t adc[8] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x10, 0x10, 0x10};
     static Inputs for_game(Game g) {
         Inputs i;
-        if (g != Game::aburner2) {
+        if (g == Game::aburner131) {
+            // MAME's aburner ports: upright, demo sounds, SWB:4 unused,
+            // 3x credits, continue, normal
+            i.io1_portd = 0xc9;
+        } else if (g == Game::rachero) {
+            // 1 credit to start, demo sounds, continue, SWB:4 unused, normal
+            // time and difficulty; ADC0-2 wheel (centre), gas, brake
+            i.io1_portd = 0xf9;
+            i.adc[1] = i.adc[2] = 0;
+            i.adc[3] = i.adc[4] = 0x10;
+        } else if (g == Game::loffire) {
+            // English, upright, 1 credit to start, normal, continue, demo
+            // sounds, single chute; ADC0-3 the guns' X and Y (P1, P2) centred
+            i.io1_portd = 0x9c;
+        } else if (g == Game::gprider) {
+            // MAME's gprider ports: upright, ID main, demo sounds, normal;
+            // ADC0-2 handlebar (centre), gas and brake at rest (PORT_REVERSE
+            // pedals 0x10-0xef: 0xef released); D4 shift down, D5 shift up
+            i.io1_portd = 0xfe;
+            i.adc[1] = i.adc[2] = 0xef;
+            i.adc[3] = i.adc[4] = 0x10;
+        } else if (g == Game::smgp) {
+            // machine 1 of 1, upright; ADC0-2 wheel (centre), gas, brake at
+            // rest; D4 shift down, D5 shift up
+            i.io1_portd = 0x7f;
+            i.adc[1] = 0x38;
+            i.adc[2] = 0x28;
+            i.adc[3] = i.adc[4] = 0x10;
+        } else if (g != Game::aburner2) {
             // D4 cannon, D5 missile; econ upright / deluxe, demo sounds, 30 s,
             // 3 lives, continue, normal; ADC0-2 stick X, throttle, stick Y
             i.io1_portd = 0xfd;
@@ -122,6 +160,7 @@ public:
     M68kExec &main() { return *main_; }
     M68kExec &sub() { return *sub_; }
     Sound &sound() { return *sound_; }
+    Sound *sound2() { return sound2_.get(); }
     Video *video() { return video_.get(); }
     sched::Scheduler &scheduler() { return sched_; }
 
@@ -170,7 +209,7 @@ private:
     Roms roms_;
     sched::Scheduler sched_;
     std::unique_ptr<M68kExec> main_, sub_;
-    std::unique_ptr<Sound> sound_;
+    std::unique_ptr<Sound> sound_, sound2_;
     std::unique_ptr<Video> video_;
     std::vector<std::unique_ptr<IoH>> handlers_;
 

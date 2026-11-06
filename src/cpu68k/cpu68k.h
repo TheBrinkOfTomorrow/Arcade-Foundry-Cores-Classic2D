@@ -5,7 +5,7 @@
 // runtime (src/runtime/snd_cpu.h, BSD-3-Clause), made generic over the CPU
 // type; they are held to MAME's 68000 by that project's lockstep checks and
 // by ours. The cycle counts the generated code adds are MAME's (see
-// docs/m68000-timing.md).
+// docs/design/M68000.md).
 #pragma once
 
 #include <cstdint>
@@ -18,6 +18,14 @@ namespace m68k {
 
 struct Fatal : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+// A word or long access at an odd address on a core that takes the 68000's
+// address error (MAME's Musashi): thrown out of the instruction, which stops
+// there, for the executor to take vector 3.
+struct AddressError {
+    uint32_t addr;
+    bool write;
 };
 
 // A device behind the bus: everything that is not plain memory.
@@ -58,6 +66,15 @@ struct Cpu {
     // long access's second word is 4 later), the access paths copy the one
     // in use to late, which the board turns into the access's time
     int late_r = 4, late_w = 4, late = 4;
+    // MAME's Musashi core (the Y Board): a long access's two words both
+    // happen at the instruction's start
+    bool musashi = false;
+    // MAME's Musashi 68000 takes an address error on an odd word access
+    // (AddressError); without it one is fatal. instr_mode is Musashi's
+    // m_instr_mode, the I/N bit of the error's frame: 8 after an interrupt,
+    // 0 after an RTE.
+    bool address_errors = false;
+    uint8_t instr_mode = 0;
     uint64_t cyc = 0;               // CPU clock cycles executed
     uint64_t insns = 0;             // instructions executed
     // RAM writes whose bus cycle starts at or after defer_at (the slice's
@@ -168,7 +185,7 @@ struct Cpu {
 
     uint16_t r16(uint32_t addr) {
         addr &= 0xffffff;
-        if (addr & 1) odd(addr);
+        if (addr & 1) odd(addr, false);
         const Page &p = page[addr >> kPageBits];
         if (p.r) {
             const uint8_t *m = p.r + (addr & ((1u << kPageBits) - 1));
@@ -195,14 +212,15 @@ struct Cpu {
             hold_hi = false;
             hi = (addr & 0xffffff) == hold_addr ? hold_val : r16(addr);
         } else hi = r16(addr);
-        late_r -= 4;
+        const int step = musashi ? 0 : 4;
+        late_r -= step;
         const uint32_t lo = r16(addr + 2);
-        late_r += 4;
+        late_r += step;
         return hi << 16 | lo;
     }
     void w16(uint32_t addr, uint32_t val) {
         addr &= 0xffffff;
-        if (addr & 1) odd(addr);
+        if (addr & 1) odd(addr, true);
         const Page &p = page[addr >> kPageBits];
         if (p.w) {
             uint8_t *m = p.w + (addr & ((1u << kPageBits) - 1));
@@ -233,10 +251,11 @@ struct Cpu {
         }
     }
     void w32(uint32_t addr, uint32_t val) {
+        const int step = musashi ? 0 : 4;
         w16(addr, val >> 16);
-        late_w -= 4;
+        late_w -= step;
         w16(addr + 2, val);
-        late_w += 4;
+        late_w += step;
     }
 
     void push16(uint32_t v16) { a[7] -= 2; w16(a[7], v16); }
@@ -245,7 +264,8 @@ struct Cpu {
     uint32_t pop32() { const uint32_t v32 = r32(a[7]); a[7] += 4; return v32; }
 
     [[noreturn]] void fatal(const std::string &what) const { throw Fatal(std::string(name) + ": " + what); }
-    [[noreturn]] void odd(uint32_t addr) const {
+    [[noreturn]] void odd(uint32_t addr, bool write) const {
+        if (address_errors) throw AddressError{addr, write};
         char b[64];
         std::snprintf(b, sizeof b, "word access at odd address %06x (pc %06x)", addr, pc);
         fatal(b);

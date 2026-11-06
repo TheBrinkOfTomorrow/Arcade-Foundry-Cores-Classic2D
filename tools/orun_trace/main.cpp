@@ -5,11 +5,12 @@
 //   s2 <insn> <cycles> <pc> <af> <bc> <de> <hl> <ix> <iy> <sp>   (Z80)
 //   f <frame> <main insns> <sub insns> <Z80 cycles>
 //
-//   orun_trace WORKDIR FRAMES [--every N] [--dense FROM:TO] [--zevery N] [--zdense FROM:TO]
+//   orun_trace WORKDIR|ROMSET FRAMES [--every N] [--dense FROM:TO] [--zevery N] [--zdense FROM:TO] [--replay FILE]
 //
-// WORKDIR holds outrun_{main,sub,sound,pcm}.bin (scripts/orun_images.py);
-// with ORUN_SET=shangon or toutrun it is that ROM set (recompile seeds/shangon.*
-// into build/gen_{main,sub}.cpp first).
+// WORKDIR holds outrun_{main,sub,sound,pcm}.bin (scripts/orun_images.py), or
+// ROMSET is the MAME set (outrun.zip or a folder of its files); with
+// ORUN_SET=shangon or toutrun it is that ROM set (built from that set's
+// gen_{main,sub}.cpp).
 #include "outrun/board.h"
 #include "outrun/replay.h"
 #include "outrun/rom_import.h"
@@ -95,10 +96,13 @@ int main(int argc, char **argv) {
     }
     const std::string dir = argv[1];
     orun::Roms roms;
-    // ORUN_SET=shangon or toutrun: WORKDIR is that ROM set itself (a .zip or folder)
-    if (const char *set = std::getenv("ORUN_SET"); set && (!std::strcmp(set, orun::kShangonRomSet) || !std::strcmp(set, orun::kToutrunRomSet))) {
+    // ORUN_SET=shangon or toutrun: WORKDIR is that ROM set itself (a .zip or
+    // folder); so is a .zip, or a folder without the images, for Out Run
+    const char *set = std::getenv("ORUN_SET");
+    const bool shangon = set && !std::strcmp(set, orun::kShangonRomSet), toutrun = set && !std::strcmp(set, orun::kToutrunRomSet);
+    if (shangon || toutrun || (dir.size() > 4 && dir.compare(dir.size() - 4, 4, ".zip") == 0) || !std::ifstream(dir + "/outrun_main.bin")) {
         try {
-            roms = orun::import_rom_set(dir, !std::strcmp(set, orun::kShangonRomSet) ? orun::Game::shangon : orun::Game::toutrun);
+            roms = orun::import_rom_set(dir, shangon ? orun::Game::shangon : toutrun ? orun::Game::toutrun : orun::Game::outrun);
         } catch (const std::exception &e) {
             std::fprintf(stderr, "orun_trace: %s\n", e.what());
             return 2;

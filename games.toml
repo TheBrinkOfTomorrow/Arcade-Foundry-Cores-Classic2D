@@ -1,0 +1,244 @@
+# The games this core builds, one [[game]] per MAME ROM set. scripts/gen_games.py
+# writes the files that list them from this one (CI checks they match), and the
+# app's scripts/gen_games.py reads it for the app's catalog. The keys are in
+# common/tools/games/afgames.py (CORE_KEYS, BOARDS, CONTROLS).
+
+[[game]]
+set = "outrun"
+title = "Out Run"
+year = 1986
+board = "outrun"
+version = "Revision B"
+core_version = "1.0.0"
+
+[[game]]
+set = "shangon"
+title = "Super Hang-On"
+year = 1987
+board = "outrun"
+version = "Sit-down/upright"
+core_version = "1.0.0"
+rom_notes = "Unprotected"
+
+[[game]]
+set = "toutrun"
+title = "Turbo Out Run"
+year = 1989
+board = "outrun"
+version = "Out Run upgrade"
+core_version = "1.0.0"
+rom_notes = "FD1094 317-0118: the key comes in MAME's set"
+
+[[game]]
+set = "aburner2"
+title = "After Burner II"
+year = 1987
+board = "xboard"
+core_version = "1.0.0"
+controls = "flight"
+
+[[game]]
+set = "aburner131"
+title = "After Burner"
+year = 1987
+board = "xboard"
+version = "VER 1.31, deluxe/upright"
+core_version = "1.0.0"
+controls = "flight"
+rom_notes = "No throttle: After Burner II added it"
+
+[[game]]
+set = "thndrbld"
+title = "Thunder Blade"
+year = 1987
+board = "xboard"
+version = "Upright"
+core_version = "1.0.0"
+controls = "flight"
+rom_notes = "FD1094 317-0056: the key comes in MAME's set"
+
+[[game]]
+set = "thndrbld1"
+title = "Thunder Blade"
+year = 1987
+board = "xboard"
+version = "Deluxe/standing, unprotected"
+core_version = "1.0.0"
+controls = "flight"
+
+[[game]]
+set = "rachero"
+title = "Racing Hero"
+year = 1989
+board = "xboard"
+core_version = "1.0.0"
+rom_notes = "FD1094 317-0144: the key comes in MAME's set"
+
+[[game]]
+set = "smgp"
+title = "Super Monaco GP"
+year = 1989
+board = "xboard"
+version = "World, upright"
+core_version = "1.0.0"
+rom_notes = "FD1094 317-0126a: the key comes in MAME's set"
+
+[[game]]
+set = "loffire"
+title = "Line of Fire"
+year = 1989
+board = "xboard"
+version = "World"
+core_version = "1.0.0"
+controls = "gun"
+players = 2
+gun_button = true
+rom_notes = "FD1094 317-0136: the key comes in MAME's set"
+
+[[game]]
+set = "gprider"
+title = "GP Rider"
+year = 1990
+board = "xboard"
+version = "World"
+core_version = "1.0.0"
+rom_notes = "FD1094 317-0163: the key comes in MAME's set. One cabinet of the twin set (MAME's `gpriders`, the same files)"
+
+[[game]]
+set = "orunners"
+title = "OutRunners"
+year = 1992
+board = "system32"
+version = "World"
+core_version = "1.0.0"
+rom_notes = "System Multi 32: the left screen"
+
+[[game]]
+set = "radr"
+title = "Rad Rally"
+year = 1991
+board = "system32"
+version = "World"
+core_version = "1.0.0"
+
+[[game]]
+set = "radm"
+title = "Rad Mobile"
+year = 1990
+board = "system32"
+version = "World"
+core_version = "1.0.0"
+
+[[game]]
+set = "f1en"
+title = "F1 Exhaust Note"
+year = 1991
+board = "system32"
+version = "World, Rev A"
+core_version = "1.0.0"
+
+[[game]]
+set = "jpark"
+title = "Jurassic Park"
+year = 1993
+board = "system32"
+version = "World, Rev A"
+core_version = "1.0.0"
+controls = "turret"
+players = 2
+
+[[game]]
+set = "sonic"
+title = "SegaSonic the Hedgehog"
+year = 1992
+board = "system32"
+version = "Japan, Rev C"
+core_version = "1.0.0"
+controls = "fighting"
+players = 2
+
+[[game]]
+set = "ga2"
+title = "Golden Axe: The Revenge of Death Adder"
+year = 1992
+board = "system32"
+version = "World, Rev B"
+core_version = "1.0.0"
+controls = "fighting"
+players = 2
+
+[[game]]
+set = "hangon"
+title = "Hang-On"
+year = 1985
+board = "hangon"
+version = "Upright/ride-on"
+core_version = "1.0.0"
+
+[[game]]
+set = "sharrier"
+title = "Space Harrier"
+year = 1985
+board = "hangon"
+version = "Rev A, upright/sit-down"
+core_version = "1.0.0"
+controls = "flight"
+rom_notes = "8751 315-5163A: its program comes in MAME's set"
+
+[[game]]
+set = "enduror"
+title = "Enduro Racer"
+year = 1986
+board = "hangon"
+version = "Rev A, YM2151"
+core_version = "1.0.0"
+stick_y = true
+rom_notes = "FD1089B 317-0013A: the key comes in MAME's set"
+
+[[game]]
+set = "gforce2"
+title = "Galaxy Force 2"
+year = 1988
+board = "yboard"
+version = "World, upright"
+core_version = "1.0.0"
+controls = "flight"
+stick_y = true
+
+[[game]]
+set = "pdrift"
+title = "Power Drift"
+year = 1988
+board = "yboard"
+version = "World, Rev A"
+core_version = "1.0.0"
+
+[[game]]
+set = "gloc"
+title = "G-LOC Air Battle"
+year = 1990
+board = "yboard"
+version = "World"
+core_version = "1.0.0"
+controls = "flight"
+stick_y = true
+
+[[game]]
+set = "strkfgtr"
+title = "Strike Fighter"
+year = 1991
+board = "yboard"
+version = "World"
+core_version = "1.0.0"
+controls = "flight"
+stick_y = true
+
+[[game]]
+set = "rchase"
+title = "Rail Chase"
+year = 1991
+board = "yboard"
+version = "World"
+core_version = "1.0.0"
+controls = "turret"
+players = 2

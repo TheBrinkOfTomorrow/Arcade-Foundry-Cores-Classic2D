@@ -9,7 +9,6 @@ namespace orun {
 
 using sched::attotime;
 
-constexpr uint32_t kSoundClock = 4'000'000; // 16 MHz / 4: Z80, YM2151, 315-5218
 
 uint64_t StreamClock::index_at(attotime now) const {
     // sound_stream::get_current_sample_index
@@ -19,8 +18,14 @@ uint64_t StreamClock::index_at(attotime now) const {
 
 // ---- 315-5218 ----
 
-SegaPcm::SegaPcm(std::vector<uint8_t> rom) : rom_(std::move(rom)) {
-    rom_.resize(0x80000, 0xff);
+SegaPcm::SegaPcm(std::vector<uint8_t> rom, bool discrete, PcmBank bank) : rom_(std::move(rom)), discrete_(discrete), bank_(bank) {
+    if (discrete_) {
+        // device_rom_interface<21>: the region mirrored through the space
+        const size_t n = rom_.empty() ? 1 : rom_.size();
+        rom_.resize(0x200000);
+        for (size_t i = n; i < rom_.size(); ++i) rom_[i] = rom_[i % n];
+    } else
+        rom_.resize(bank_.size, 0xff);
     reset_ram();
 }
 
@@ -35,8 +40,8 @@ void SegaPcm::tick(Voice &v) {
             }
             v.addr = uint32_t(v.loop) << 8;
         }
-        const uint32_t bank = uint32_t(v.ctrl & 0x70) << 12; // BANK_512
-        const int8_t s = int8_t(rom_[(bank + (v.addr >> 8)) & 0x7ffff] - 0x80);
+        const uint32_t bank = discrete_ ? 0 : uint32_t(v.ctrl & bank_.mask) << bank_.shift; // get_bank
+        const int8_t s = int8_t(rom_[(bank + (v.addr >> 8)) & (discrete_ ? 0x1fffff : bank_.size - 1)] - 0x80);
         v.lout = s * (v.lvol & 0x7f);
         v.rout = s * (v.rvol & 0x7f);
         v.addr = (v.addr + v.freq) & 0xffffff;
@@ -46,7 +51,8 @@ void SegaPcm::tick(Voice &v) {
 
 void SegaPcm::generate(int32_t *lr) {
     int32_t l = 0, r = 0;
-    for (Voice &v : voice_) {
+    for (int i = 0; i < voices(); ++i) {
+        Voice &v = voice_[i];
         tick(v);
         l += v.lout;
         r += v.rout;
@@ -58,6 +64,21 @@ void SegaPcm::generate(int32_t *lr) {
 // sega_315_5218_device::map: RAM over 0x00-0xff, the voice registers at
 // 0x02-0x07 and 0x84-0x86 of each 8-byte group (select 0x78)
 uint8_t SegaPcm::read(uint8_t offset) {
+    if (discrete_) {
+        Voice &v = voice_[(offset >> 3) & 7];
+        switch (offset & 0xc7) {
+        case 0x42: return v.lvol;
+        case 0x43: return v.rvol;
+        case 0x44: return uint8_t(v.loop);
+        case 0x45: return uint8_t(v.loop >> 8);
+        case 0x46: return v.end;
+        case 0x47: return v.freq;
+        case 0xc4: return uint8_t(v.addr >> 8);
+        case 0xc5: return uint8_t(v.addr >> 16);
+        case 0xc6: return v.ctrl;
+        default: return ram[offset];
+        }
+    }
     Voice &v = voice_[(offset >> 3) & 15];
     switch (offset & 0x87) {
     case 0x02: return v.lvol;
@@ -74,6 +95,21 @@ uint8_t SegaPcm::read(uint8_t offset) {
 }
 
 void SegaPcm::write(uint8_t offset, uint8_t data) {
+    if (discrete_) {
+        Voice &v = voice_[(offset >> 3) & 7];
+        switch (offset & 0xc7) {
+        case 0x42: v.lvol = data; return;
+        case 0x43: v.rvol = data; return;
+        case 0x44: v.loop = uint16_t((v.loop & 0xff00) | data); return;
+        case 0x45: v.loop = uint16_t((v.loop & 0x00ff) | data << 8); return;
+        case 0x46: v.end = data; return;
+        case 0x47: v.freq = data; return;
+        case 0xc4: v.addr = (v.addr & ~0xff00u) | uint32_t(data) << 8; return;
+        case 0xc5: v.addr = (v.addr & ~0xff0000u) | uint32_t(data) << 16; return;
+        case 0xc6: v.ctrl = data; return;
+        default: ram[offset] = data; return;
+        }
+    }
     Voice &v = voice_[(offset >> 3) & 15];
     switch (offset & 0x87) {
     case 0x02: v.lvol = data; return;
@@ -91,23 +127,24 @@ void SegaPcm::write(uint8_t offset, uint8_t data) {
 
 // ---- the sound section ----
 
-Sound::Sound(sched::Scheduler &s, std::vector<uint8_t> rom, std::vector<uint8_t> pcm_rom)
-    : sched_(s), rom_(std::move(rom)), ym_(*this), pcm_(std::move(pcm_rom)) {
+Sound::Sound(sched::Scheduler &s, std::vector<uint8_t> rom, std::vector<uint8_t> pcm_rom, const char *cpu_name, bool has_ym, uint32_t clock,
+             PcmBank bank)
+    : sched_(s), rom_(std::move(rom)), ym_(*this), pcm_(std::move(pcm_rom), false, bank), has_ym_(has_ym), clock_(clock) {
     rom_.resize(0x10000, 0);
-    cpu_ = std::make_unique<z80::Z80>(s, "soundcpu", kSoundClock, *this);
-    ym_clock_.rate = ym_.sample_rate(kSoundClock);
-    pcm_clock_.rate = kSoundClock / 128;
+    cpu_ = std::make_unique<z80::Z80>(s, cpu_name, clock_, *this);
+    ym_clock_.rate = ym_.sample_rate(clock_);
+    pcm_clock_.rate = clock_ / 128;
 }
 
 Sound::~Sound() = default;
 
 void Sound::power_on() {
     // device_start: the YM2151's timers; device_reset of each part
-    for (int t = 0; t < 2; ++t)
+    for (int t = 0; t < 2 && has_ym_; ++t)
         ym_timer_[t] = sched_.timer_alloc([this](int32_t tnum) { m_engine->engine_timer_expired(uint32_t(tnum)); },
                                           "ym_generic_device::fm_timer_handler");
     cpu_->power_on();
-    ym_.reset();
+    if (has_ym_) ym_.reset();
 }
 
 void Sound::latch_write(uint8_t data) {
@@ -143,6 +180,7 @@ void Sound::write(uint16_t a, uint8_t d) {
 uint8_t Sound::in(uint16_t port) {
     port &= 0xff;
     if (port < 0x40) {
+        if (!has_ym_) return 0xff; // unmap_value_high
         ym_update();
         return ym_.read(port & 1);
     }
@@ -157,7 +195,7 @@ uint8_t Sound::in(uint16_t port) {
 
 void Sound::out(uint16_t port, uint8_t d) {
     port &= 0xff;
-    if (port < 0x40) {
+    if (port < 0x40 && has_ym_) {
         ym_update();
         ym_.write(port & 1, d);
     }
@@ -207,11 +245,11 @@ void Sound::ymfm_sync_check_interrupts() {
 }
 
 void Sound::ymfm_set_timer(uint32_t tnum, int32_t duration_in_clocks) {
-    if (duration_in_clocks >= 0) ym_timer_[tnum]->adjust(attotime::from_ticks(uint64_t(duration_in_clocks), kSoundClock), int32_t(tnum));
+    if (duration_in_clocks >= 0) ym_timer_[tnum]->adjust(attotime::from_ticks(uint64_t(duration_in_clocks), clock_), int32_t(tnum));
     else ym_timer_[tnum]->enable(false);
 }
 
-void Sound::ymfm_set_busy_end(uint32_t clocks) { busy_end_ = sched_.time() + attotime::from_ticks(clocks, kSoundClock); }
+void Sound::ymfm_set_busy_end(uint32_t clocks) { busy_end_ = sched_.time() + attotime::from_ticks(clocks, clock_); }
 
 bool Sound::ymfm_is_busy() { return sched_.time() < busy_end_; }
 

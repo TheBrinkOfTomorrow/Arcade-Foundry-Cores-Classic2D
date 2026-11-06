@@ -1,0 +1,324 @@
+# Y Board trace for segaybd.cpp, on top of 0001-0005: MAME's Y Board uses the
+# Musashi 68000 core (m68000msh_device), so the trace lines come from
+# m68kcpu.cpp: "s<cpu> INSN CYCLES PC SR D0-D7 A0-A6 SP OTHERSP" every
+# ORTRACE_EVERY instructions and after each interrupt, "i<cpu> INSN CYCLES
+# LEVEL" (cpu 0 maincpu, 1 subx, 2 suby), ORTRACE_PCS=PREFIX writes the
+# seeds PREFIX.main/.subx/.suby at exit, ORTRACE_MSH_CYCLES dumps Musashi's
+# 68000 cycle table (to check src/m68k/musashi_cycles.h). Each screen update
+# logs "f UPDATE MAIN SUBX SUBY Z80CYC IDXHASH RGBHASH" (only the rows that
+# update drew), ORTRACE_FBDUMP_DIR/_EVERY write the frames, ORTRACE_REPLAY
+# replays tests/replays/ybd_*.rpl (P1, GENERAL, LIMITSW, DSW, COINAGE,
+# ADC0-5). Build: make SUBTARGET=ybd SOURCES=src/mame/sega/segaybd.cpp
+# (cpu.lua's added line lets that build find the Musashi core).
+
+diff --git a/scripts/src/cpu.lua b/scripts/src/cpu.lua
+index 54caeaca55..05161b147d 100644
+--- a/scripts/src/cpu.lua
++++ b/scripts/src/cpu.lua
+@@ -2182,6 +2182,7 @@ end
+ --------------------------------------------------
+ -- Motorola 68000 series
+ --@src/devices/cpu/m68000/m68000.h,CPUS["M680X0"] = true
++--@src/devices/cpu/m68000/m68000musashi.h,CPUS["M680X0"] = true
+ --@src/devices/cpu/m68000/m68008.h,CPUS["M680X0"] = true
+ --@src/devices/cpu/m68000/m68010.h,CPUS["M680X0"] = true
+ --@src/devices/cpu/m68000/m68020.h,CPUS["M680X0"] = true
+diff --git a/src/devices/cpu/m68000/m68kcpu.cpp b/src/devices/cpu/m68000/m68kcpu.cpp
+index cadd62e78e..60eb842e91 100644
+--- a/src/devices/cpu/m68000/m68kcpu.cpp
++++ b/src/devices/cpu/m68000/m68kcpu.cpp
+@@ -28,6 +28,47 @@ static const char copyright_notice[] =
+ #include "m68kmusashi.h"
+ #include "m68kdasm.h"
+ 
++#include <set>
++#include <string>
++
++// Y Board oracle (ORTRACE_LOG, ORTRACE_PCS, ORTRACE_EVERY): the three
++// 68000s' instruction counts, interrupts and register snapshots, in the
++// format of m68000_device's Out Run board trace (0001-outrun-trace.patch)
++extern FILE *g_ortrace_log;
++static bool g_msh_tried = false;
++static std::set<u32> g_msh_pcs[3];
++static const char *g_msh_pcs_path = nullptr;
++static u64 g_msh_mask = 4095;
++
++int m68000_musashi_device::ortrace_id() const
++{
++	if(!g_msh_tried) {
++		g_msh_tried = true;
++		if(!g_ortrace_log) if(const char *p = getenv("ORTRACE_LOG")) g_ortrace_log = fopen(p, "w");
++		g_msh_pcs_path = getenv("ORTRACE_PCS");
++		if(const char *e = getenv("ORTRACE_EVERY")) g_msh_mask = strtoull(e, nullptr, 10) - 1; // a power of two
++	}
++	const std::string t(tag());
++	if(t == ":maincpu") return 0;
++	if(t == ":subx") return 1;
++	if(t == ":suby") return 2;
++	return -1;
++}
++
++void ortrace_msh_write_pcs()
++{
++	if(!g_msh_pcs_path) return;
++	static const char *const names[3] = { ".main", ".subx", ".suby" };
++	for(int c = 0; c < 3; c++) {
++		if(g_msh_pcs[c].empty()) continue;
++		std::string p = std::string(g_msh_pcs_path) + names[c];
++		if(FILE *f = fopen(p.c_str(), "w")) {
++			for(u32 a : g_msh_pcs[c]) fprintf(f, "%06x\n", a);
++			fclose(f);
++		}
++	}
++}
++
+ // Generated data
+ 
+ u16 m68000_musashi_device::m68ki_instruction_state_table[NUM_CPU_TYPES][0x10000]; /* opcode handler jump table */
+@@ -926,6 +967,18 @@ void m68000_musashi_device::execute_run()
+ 			/* Call external hook to peek at CPU */
+ 			debugger_instruction_hook(m_pc);
+ 
++			if(m_or_id >= 0) {
++				if(g_ortrace_log && (m_or_snap || !(m_or_insn & g_msh_mask))) {
++					fprintf(g_ortrace_log, "s%d %llu %llu %06x %04x", m_or_id, (unsigned long long)m_or_insn, (unsigned long long)total_cycles(), m_pc & 0xffffff, m68ki_get_sr());
++					for(int i = 0; i < 15; i++)
++						fprintf(g_ortrace_log, " %08x", m_dar[i]);
++					fprintf(g_ortrace_log, " %08x %08x\n", m_dar[15], m_s_flag ? REG_USP() : REG_ISP());
++					m_or_snap = false;
++				}
++				if(g_msh_pcs_path) g_msh_pcs[m_or_id].insert(m_pc & 0xffffff);
++				m_or_insn++;
++			}
++
+ 			try
+ 			{
+ 			if (!m_can_instruction_restart)
+@@ -1073,6 +1126,10 @@ void m68000_musashi_device::init_cpu_common(void)
+ 		m68ki_build_opcode_table();
+ 		emulation_initialized = 1;
+ 	}
++	m_or_id = ortrace_id();
++	// ORTRACE_MSH_CYCLES: the 68000's cycle table (to check the native copy)
++	if(const char *p = getenv("ORTRACE_MSH_CYCLES"); p && m_or_id == 0)
++		if(FILE *f = fopen(p, "wb")) { fwrite(m68ki_cycles[0], 1, 0x10000, f); fclose(f); }
+ 
+ 	/* Note, D covers A because the dar array is common, REG_A(m68k)=REG_D(m68k)+8 */
+ 	save_item(NAME(REG_D()));
+@@ -2522,6 +2579,11 @@ void m68000_musashi_device::m68ki_exception_interrupt(u32 int_level)
+ 	if(m_stopped)
+ 		return;
+ 
++	if(m_or_id >= 0) {
++		if(g_ortrace_log) fprintf(g_ortrace_log, "i%d %llu %llu %u\n", m_or_id, (unsigned long long)m_or_insn, (unsigned long long)total_cycles(), int_level);
++		m_or_snap = true;
++	}
++
+ 	/* Inform the device than an interrupt is taken */
+ 	if(m_interrupt_mixer)
+ 		standard_irq_callback(int_level, m_pc);
+diff --git a/src/devices/cpu/m68000/m68kmusashi.h b/src/devices/cpu/m68000/m68kmusashi.h
+index 45ea08ea3b..cfbbbc4f8a 100644
+--- a/src/devices/cpu/m68000/m68kmusashi.h
++++ b/src/devices/cpu/m68000/m68kmusashi.h
+@@ -241,6 +241,16 @@ protected:
+ 
+ 	u32      m_iotemp;
+ 
++	// Y Board oracle (ORTRACE_LOG / ORTRACE_PCS): instruction counts and
++	// register snapshots, as m68000_device's Out Run board trace
++	int m_or_id = -1;
++	bool m_or_snap = true;
++	u64 m_or_insn = 0;
++	int ortrace_id() const;
++public:
++	u64 or_insn() const { return m_or_insn; }
++protected:
++
+ 	/* save state data */
+ 	u16 m_save_sr;
+ 	u8 m_save_stopped;
+diff --git a/src/mame/sega/segaybd.cpp b/src/mame/sega/segaybd.cpp
+index d105290ac9..b108926e09 100644
+--- a/src/mame/sega/segaybd.cpp
++++ b/src/mame/sega/segaybd.cpp
+@@ -219,6 +219,11 @@ EPR-12028 - 27C256 EPROM
+ 
+ #include "pdrift.lh"
+ 
++#include <vector>
++
++extern FILE *g_ortrace_log;
++void ortrace_msh_write_pcs();
++
+ 
+ //**************************************************************************
+ //  CONSTANTS
+@@ -307,6 +312,7 @@ private:
+ 
+ 	// input helpers
+ 	ioport_value analog_mux();
++	template <int N> ioport_value adc_in();
+ 
+ 	// game-specific output handlers
+ 	void gforce2_output_cb1(uint16_t data);
+@@ -320,6 +326,7 @@ private:
+ 
+ 	// video updates
+ 	uint32_t screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
++	uint32_t screen_update_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+ 
+ 	void link_map(address_map &map) ATTR_COLD;
+ 	void link_portmap(address_map &map) ATTR_COLD;
+@@ -391,9 +398,99 @@ private:
+ //  (HC4052 at IC121)
+ //-------------------------------------------------
+ 
++// Y Board oracle (ORTRACE_LOG): one line per screen update with the three
++// 68000s' instruction counts, the sound CPU's cycles and hashes of the
++// indexed and RGB screen; ORTRACE_REPLAY: "UPDATE PORT VALUE" lines (PORT:
++// p1, general, limitsw, dsw, coinage, adc0-adc5; VALUE hex), applied after
++// the native core's screen update UPDATE (MAME's UPDATE+1).
++// ORTRACE_FBDUMP_DIR/_EVERY dump RGB frames.
++static int g_yb_in[11] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
++struct yb_replay_ev { u64 update; int port; int value; };
++static std::vector<yb_replay_ev> g_yb_replay;
++static size_t g_yb_replay_pos = 0;
++static void ybtrace_replay_load()
++{
++	const char *path = getenv("ORTRACE_REPLAY");
++	if (!path) return;
++	FILE *f = fopen(path, "r");
++	if (!f) return;
++	static const char *const names[11] = { "p1", "general", "limitsw", "dsw", "coinage", "adc0", "adc1", "adc2", "adc3", "adc4", "adc5" };
++	char line[256];
++	while (fgets(line, sizeof line, f))
++	{
++		unsigned long long u; char name[32]; unsigned v;
++		if (line[0] == '#' || sscanf(line, "%llu %31s %x", &u, name, &v) != 3) continue;
++		for (int i = 0; i < 11; i++)
++			if (!strcmp(name, names[i])) g_yb_replay.push_back({ u, i, int(v & 0xff) });
++	}
++	fclose(f);
++}
++
++static void ybtrace_frame(device_execute_interface &main, device_execute_interface &subx, device_execute_interface &suby, device_execute_interface &snd,
++		u64 main_insn, u64 subx_insn, u64 suby_insn, palette_device &palette, bitmap_ind16 &bitmap, const rectangle &clip)
++{
++	static u64 frame = 0;
++	static bool init = false;
++	static const char *dir = nullptr;
++	static u64 every = 1;
++	if (!init)
++	{
++		init = true;
++		dir = getenv("ORTRACE_FBDUMP_DIR");
++		if (const char *e = getenv("ORTRACE_FBDUMP_EVERY")) every = strtoull(e, nullptr, 10);
++		if (!every) every = 1;
++		ybtrace_replay_load();
++	}
++	if (g_ortrace_log || dir)
++	{
++		u64 hi = 1469598103934665603ULL, hr = 1469598103934665603ULL;
++		std::vector<u8> rgb;
++		if (dir && !(frame % every)) rgb.reserve(320 * 224 * 3);
++		for (int y = 0; y < 224; y++)
++		{
++			// only the rows this update drew (a partial update leaves the
++			// rest as they were two frames ago: MAME alternates two bitmaps)
++			const bool hash_row = y >= clip.min_y && y <= clip.max_y;
++			u16 const *row = &bitmap.pix(y);
++			for (int x = 0; x < 320; x++)
++			{
++				rgb_t const c = palette.pen_color(row[x]);
++				if (hash_row)
++				{
++					hi = (hi ^ row[x]) * 1099511628211ULL;
++					hr = (hr ^ (c & 0xffffff)) * 1099511628211ULL;
++				}
++				if (dir && !(frame % every)) { rgb.push_back(c.r()); rgb.push_back(c.g()); rgb.push_back(c.b()); }
++			}
++		}
++		if (g_ortrace_log)
++			fprintf(g_ortrace_log, "f %llu %llu %llu %llu %llu %016llx %016llx\n", (unsigned long long)frame, (unsigned long long)main_insn,
++					(unsigned long long)subx_insn, (unsigned long long)suby_insn, (unsigned long long)snd.total_cycles(), (unsigned long long)hi, (unsigned long long)hr);
++		if (dir && !(frame % every))
++		{
++			char path[1024];
++			snprintf(path, sizeof path, "%s/f%06llu.rgb", dir, (unsigned long long)frame);
++			if (FILE *f = fopen(path, "wb")) { fwrite(rgb.data(), 1, rgb.size(), f); fclose(f); }
++		}
++	}
++	while (g_yb_replay_pos < g_yb_replay.size() && g_yb_replay[g_yb_replay_pos].update + 1 <= frame)
++	{
++		g_yb_in[g_yb_replay[g_yb_replay_pos].port] = g_yb_replay[g_yb_replay_pos].value;
++		g_yb_replay_pos++;
++	}
++	frame++;
++}
++
++template <int N> ioport_value segaybd_state::adc_in()
++{
++	return g_yb_in[5 + N] >= 0 ? g_yb_in[5 + N] : m_adc_ports[N].read_safe(0xff);
++}
++
+ ioport_value segaybd_state::analog_mux()
+ {
+-	return m_adc_ports[3 + (m_misc_io_data & 3)].read_safe(0x80);
++	const int which = 3 + (m_misc_io_data & 3);
++	if (which < 6 && g_yb_in[5 + which] >= 0) return g_yb_in[5 + which];
++	return m_adc_ports[which].read_safe(0x80);
+ }
+ 
+ 
+@@ -465,6 +562,13 @@ void segaybd_state::video_start()
+ //**************************************************************************
+ 
+ uint32_t segaybd_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
++{
++	uint32_t const r = screen_update_draw(screen, bitmap, cliprect);
++	ybtrace_frame(*m_maincpu, *m_subx, *m_suby, *m_soundcpu, m_maincpu->or_insn(), m_subx->or_insn(), m_suby->or_insn(), *m_palette, bitmap, cliprect);
++	return r;
++}
++
++uint32_t segaybd_state::screen_update_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
+ {
+ 	// if no drawing is happening, fill with black and get out
+ 	if (!m_segaic16vid->m_display_enable)
+@@ -1665,20 +1769,20 @@ void segaybd_state::yboard(machine_config &config)
+ 	MB3773(config, "watchdog"); // IC95
+ 
+ 	sega_315_5296_device &io(SEGA_315_5296(config, "io", MASTER_CLOCK/8));
+-	io.in_pa_callback().set_ioport("P1");
+-	io.in_pb_callback().set_ioport("GENERAL");
+-	io.in_pc_callback().set_ioport("LIMITSW");
++	io.in_pa_callback().set([this] () -> u8 { return g_yb_in[0] >= 0 ? u8(g_yb_in[0]) : u8(ioport("P1")->read()); });
++	io.in_pb_callback().set([this] () -> u8 { return g_yb_in[1] >= 0 ? u8(g_yb_in[1]) : u8(ioport("GENERAL")->read()); });
++	io.in_pc_callback().set([this] () -> u8 { return g_yb_in[2] >= 0 ? u8(g_yb_in[2]) : u8(ioport("LIMITSW")->read()); });
+ 	io.out_pd_callback().set(FUNC(segaybd_state::output1_w));
+ 	io.out_pe_callback().set(FUNC(segaybd_state::misc_output_w));
+-	io.in_pf_callback().set_ioport("DSW");
+-	io.in_pg_callback().set_ioport("COINAGE");
++	io.in_pf_callback().set([this] () -> u8 { return g_yb_in[3] >= 0 ? u8(g_yb_in[3]) : u8(ioport("DSW")->read()); });
++	io.in_pg_callback().set([this] () -> u8 { return g_yb_in[4] >= 0 ? u8(g_yb_in[4]) : u8(ioport("COINAGE")->read()); });
+ 	io.out_ph_callback().set(FUNC(segaybd_state::output2_w));
+ 	// FMCS and CKOT connect to CS and OSC IN on MSM6253 below
+ 
+ 	msm6253_device &adc(MSM6253(config, "adc"));
+-	adc.set_input_tag<0>("ADC.0");
+-	adc.set_input_tag<1>("ADC.1");
+-	adc.set_input_tag<2>("ADC.2");
++	adc.set_input_cb<0>(FUNC(segaybd_state::adc_in<0>));
++	adc.set_input_cb<1>(FUNC(segaybd_state::adc_in<1>));
++	adc.set_input_cb<2>(FUNC(segaybd_state::adc_in<2>));
+ 	adc.set_input_cb<3>(FUNC(segaybd_state::analog_mux));
+ 
+ 	SEGA_315_5248_MULTIPLIER(config, "multiplier_main");
+@@ -3429,6 +3533,7 @@ void segaybd_state::init_generic()
+ {
+ 	// allocate a scanline timer
+ 	m_scanline_timer = timer_alloc(FUNC(segaybd_state::irq2_gen_tick), this);
++	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () { ortrace_msh_write_pcs(); }));
+ 
+ 	// save state
+ 	save_item(NAME(m_pdrift_bank));

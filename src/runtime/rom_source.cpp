@@ -25,7 +25,7 @@ bool equal_nocase(const std::string &a, const char *b) {
 RomSource::RomSource(const std::string &path) : dir_(is_dir(path) ? path : "") {
     if (dir_.empty()) {
         try {
-            zip_ = std::make_unique<Zip>(path);
+            zip_ = std::make_unique<afc::Zip>(path);
         } catch (const std::exception &e) {
             throw RomError(path + ": " + e.what());
         }
@@ -62,7 +62,7 @@ std::vector<uint8_t> RomSource::get(const RomFile &f) const {
         d.assign(std::istreambuf_iterator<char>(in), {});
     }
     if (d.size() != f.size) throw RomError(std::string(f.name) + " has the wrong size");
-    if (crc32(d.data(), d.size()) != f.crc) {
+    if (afc::crc32(d.data(), d.size()) != f.crc) {
         char buf[160];
         std::snprintf(buf, sizeof buf, "%s has the wrong CRC (a bad dump or another version; expected %08x)", f.name, f.crc);
         throw RomError(buf);

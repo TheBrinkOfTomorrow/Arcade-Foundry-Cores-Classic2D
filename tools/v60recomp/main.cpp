@@ -501,9 +501,13 @@ int main(int argc, char **argv) {
                 for (uint32_t p = key, n = 0; from.count(p) && n < 24; p = from[p], n++) path += " < " + hex6(from[p] & 0xffffff);
                 const std::string e = hex6(pc) + ": " + in.error + (path.empty() ? "" : "  (reached" + path + ")");
                 // past a call that never returns (an error handler's data),
-                // or a seed in a copy that is not the one it ran in: no code
-                // there, as under MAME, which never runs it
-                if (after_call.count(key) || v >= 0) std::fprintf(stderr, "v60recomp: warning: %s\n", e.c_str());
+                // a seed in a copy that is not the one it ran in, or a path
+                // no run took (Jurassic Park's DBcc at 0e2f03 never branches
+                // to its target, which is data): no code there, as under
+                // MAME, which never runs it; reaching it stops the game
+                // with "no recompiled code"
+                if (after_call.count(key) || v >= 0 || !seeds.count(pc))
+                    std::fprintf(stderr, "v60recomp: warning: %s\n", e.c_str());
                 else errors.push_back(e);
                 insns[key] = in;
                 continue;

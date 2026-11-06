@@ -1,3 +1,4 @@
+#include "af_debug.h"
 #include "outrun/m68k_exec.h"
 
 #include <algorithm>
@@ -10,7 +11,7 @@ namespace orun {
 M68kExec::M68kExec(sched::Scheduler &s, const char *name, uint32_t clock, RunFn r, HasCode h)
     : sched::Exec(s, name, clock), run(r), has_code(h) {
     c.name = name;
-    if (const char *v = std::getenv("C2D_INTERP")) interp_only = !std::strcmp(v, "all");
+    if (const char *v = af_debug_env("C2D_INTERP")) interp_only = !std::strcmp(v, "all");
     // code the recompiler did not reach: interpret until control is back
     // in recompiled code. Each new address is logged (rules.md): it is a
     // seed for the next recompile.
@@ -204,6 +205,9 @@ void M68kExec::execute_run() {
                 break;
             }
         }
+        // an instruction resumed from the last slice: a line that changed
+        // at the slice boundary is taken right after it, as MAME does
+        if (resume && int_next_) step = true;
         resume = false;
         if (step) {
             e.stop = std::min<uint64_t>(c.cyc + 1, e.stop);
@@ -233,8 +237,11 @@ void M68kExec::execute_run() {
     // MAME's 68000 stops only after a bus access: if the access before the
     // last instruction's interrupt sample ended inside the slice, the CPU
     // sampled its lines in this slice; if not, in a later one (above)
+    // A slice cut short by a device access (abort_timeslice) ends at that
+    // access's start: the sample came before it when the access before the
+    // sample ended by then (a read-modify-write's write follows its sample).
     if (c.insns != insns0 || c.cyc != cyc0 || resume_) {
-        sample_pending_ = !resume_ && c.ys >= zero_;
+        sample_pending_ = !resume_ && (aborted_ ? c.ys > zero_ : c.ys >= zero_);
         sampled_valid_ = !resume_ && !sample_pending_;
         sampled_ = int_next_;
     }

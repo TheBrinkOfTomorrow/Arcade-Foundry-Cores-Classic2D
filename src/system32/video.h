@@ -36,7 +36,8 @@ public:
     // screen_update_multi32_left / _right (index 0 / 1) or System 32's,
     // into 416x224 0x00RRGGBB pixels
     void render(int index, uint32_t *out);
-    // the visible width of the last render (416, or 320 when 0x1ff00 bit 15 is clear)
+    // the width the last render drew (416, or 320 when 0x1ff00 bit 15 was
+    // clear at the frame before)
     int width() const;
 
 private:

@@ -8,18 +8,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# The game this build makes a core for (MAME's set name), and its board.
-set(C2D_ROMSET outrun CACHE STRING "MAME ROM set: outrun, shangon, toutrun, aburner2, thndrbld, thndrbld1, orunners, radr")
-set_property(CACHE C2D_ROMSET PROPERTY STRINGS outrun shangon toutrun aburner2 thndrbld thndrbld1 orunners radr)
-if(C2D_ROMSET STREQUAL "outrun" OR C2D_ROMSET STREQUAL "shangon" OR C2D_ROMSET STREQUAL "toutrun")
-    set(C2D_BOARD outrun)
-elseif(C2D_ROMSET STREQUAL "aburner2" OR C2D_ROMSET STREQUAL "thndrbld" OR C2D_ROMSET STREQUAL "thndrbld1")
-    set(C2D_BOARD xboard)
-elseif(C2D_ROMSET STREQUAL "orunners" OR C2D_ROMSET STREQUAL "radr")
-    set(C2D_BOARD system32)
-else()
-    message(FATAL_ERROR "C2D_ROMSET must be outrun, shangon, toutrun, aburner2, thndrbld, thndrbld1, orunners or radr, not ${C2D_ROMSET}")
+# The game this build makes a core for (MAME's set name), and its board:
+# games.toml lists them (scripts/gen_games.py writes cmake/games.cmake).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/games.cmake)
+string(REPLACE ";" ", " C2D_SETS_TEXT "${C2D_SETS}")
+set(C2D_ROMSET outrun CACHE STRING "MAME ROM set: ${C2D_SETS_TEXT}")
+set_property(CACHE C2D_ROMSET PROPERTY STRINGS ${C2D_SETS})
+if(NOT C2D_ROMSET IN_LIST C2D_SETS)
+    message(FATAL_ERROR "C2D_ROMSET must be one of ${C2D_SETS_TEXT} (games.toml), not ${C2D_ROMSET}")
 endif()
+set(C2D_BOARD ${C2D_BOARD_${C2D_ROMSET}})
 # Where scripts/recompile.py put the recompiled code (C2D_GEN_ROOT/<set>/):
 # derived from the ROMs, so it lives under build/ and is never committed.
 set(C2D_GEN_ROOT ${CMAKE_BINARY_DIR}/gen CACHE PATH "Recompiled code root")
@@ -74,17 +72,26 @@ add_library(c2d_common STATIC
     src/outrun/sound.cpp
     src/outrun/video.cpp
     src/outrun/m68k_exec.cpp
+    src/outrun/musashi_exec.cpp
     src/cpu68k/interp.cpp
     src/m68k/decode.cpp
     src/fd1094/opcode_image.cpp
     src/sched/scheduler.cpp
     src/z80/z80.cpp
-    src/runtime/zip.cpp
     src/runtime/rom_source.cpp
-    src/fd1094/fd1094.cpp)
+    src/runtime/i8255.cpp
+    src/runtime/mcs51.cpp
+    src/fd1094/fd1094.cpp
+    src/fd1089/fd1089.cpp)
 add_dependencies(c2d_common z80gen)
-target_include_directories(c2d_common PUBLIC src include PRIVATE ${CMAKE_BINARY_DIR}/z80gen)
-target_link_libraries(c2d_common PUBLIC ymfm_opm)
+target_include_directories(c2d_common PUBLIC src PRIVATE ${CMAKE_BINARY_DIR}/z80gen)
+# The core interface header and the zip reader, shared with the other core
+# repos (submodule common/, Arcade-Foundry-Cores-Common).
+if(NOT EXISTS ${CMAKE_SOURCE_DIR}/common/CMakeLists.txt)
+    message(FATAL_ERROR "common/ is empty: run git submodule update --init")
+endif()
+add_subdirectory(common)
+target_link_libraries(c2d_common PUBLIC ymfm_opm afc::afcommon afc::afcore)
 
 # The boards (everything but the recompiled programs)
 add_library(outrun_board STATIC src/outrun/board.cpp)
@@ -92,11 +99,16 @@ target_link_libraries(outrun_board PUBLIC c2d_common)
 add_library(xboard_board STATIC src/xboard/board.cpp)
 target_link_libraries(xboard_board PUBLIC c2d_common)
 add_library(system32_board STATIC src/system32/board.cpp src/system32/video.cpp src/system32/v60_exec.cpp
-    src/runtime/eeprom93c46.cpp src/runtime/multipcm.cpp src/runtime/rf5c68.cpp src/v60/native.cpp)
+    src/runtime/eeprom93c46.cpp src/runtime/multipcm.cpp src/runtime/rf5c68.cpp src/runtime/v25/v25.cpp src/v60/native.cpp)
 target_link_libraries(system32_board PUBLIC c2d_common ymfm_opn)
+add_library(yboard_board STATIC src/yboard/board.cpp src/yboard/video.cpp)
+target_link_libraries(yboard_board PUBLIC c2d_common)
+add_library(hangon_board STATIC src/hangon/board.cpp src/hangon/sound.cpp)
+target_link_libraries(hangon_board PUBLIC c2d_common ymfm_opn)
 
 # ROM import for every set (no board code: it only reads the ROMs)
-add_library(c2d_import STATIC src/outrun/rom_import.cpp src/xboard/rom_import.cpp src/system32/rom_import.cpp)
+add_library(c2d_import STATIC src/outrun/rom_import.cpp src/xboard/rom_import.cpp src/system32/rom_import.cpp src/hangon/rom_import.cpp
+    src/yboard/rom_import.cpp)
 target_link_libraries(c2d_import PUBLIC c2d_common)
 
 # Host tools: the 68000 recompiler and the program images it reads
@@ -118,6 +130,13 @@ if(C2D_BOARD STREQUAL "system32")
     if(EXISTS ${GEN_DIR}/table.cpp)
         set(C2D_HAVE_GEN TRUE)
     endif()
+elseif(C2D_BOARD STREQUAL "yboard")
+    # three 68000s: main, X and Y
+    set(GEN_SOURCES ${GEN_DIR}/gen_main.cpp ${GEN_DIR}/gen_subx.cpp ${GEN_DIR}/gen_suby.cpp)
+    set(C2D_HAVE_GEN FALSE)
+    if(EXISTS ${GEN_DIR}/gen_main.cpp AND EXISTS ${GEN_DIR}/gen_subx.cpp AND EXISTS ${GEN_DIR}/gen_suby.cpp)
+        set(C2D_HAVE_GEN TRUE)
+    endif()
 else()
     set(GEN_SOURCES ${GEN_DIR}/gen_main.cpp ${GEN_DIR}/gen_sub.cpp)
     set(C2D_HAVE_GEN FALSE)
@@ -132,17 +151,11 @@ if(C2D_CORE AND C2D_HAVE_GEN)
     add_library(afcore_${C2D_ROMSET} SHARED src/${C2D_BOARD}/core.cpp ${GEN_SOURCES})
     target_link_libraries(afcore_${C2D_ROMSET} PRIVATE ${C2D_BOARD}_board c2d_import)
     target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE AFCORE_BUILD)
-    if(C2D_ROMSET STREQUAL "shangon")
-        target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE C2D_SHANGON)
-    elseif(C2D_ROMSET STREQUAL "toutrun")
-        target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE C2D_TOUTRUN)
-    elseif(C2D_ROMSET STREQUAL "thndrbld")
-        target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE C2D_THNDRBLD)
-    elseif(C2D_ROMSET STREQUAL "thndrbld1")
-        target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE C2D_THNDRBLD1)
-    elseif(C2D_ROMSET STREQUAL "radr")
-        target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE C2D_RADR)
-    endif()
+    # C2D_<SET>: the set, for the board's code that differs by game (C2D_SHANGON);
+    # C2D_CORE_VERSION: its core_version in games.toml
+    string(TOUPPER "C2D_${C2D_ROMSET}" C2D_SET_DEFINE)
+    target_compile_definitions(afcore_${C2D_ROMSET} PRIVATE ${C2D_SET_DEFINE}
+        "C2D_CORE_VERSION=AFCORE_MAKE_VERSION(${C2D_CORE_VERSION_${C2D_ROMSET}})")
     set_target_properties(afcore_${C2D_ROMSET} PROPERTIES OUTPUT_NAME afcore_${C2D_ROMSET}
         CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
     if(APPLE)
@@ -163,9 +176,74 @@ if(C2D_CORE AND C2D_HAVE_GEN)
     # input replay, frame and audio dumps (tools/afcore_run)
     if(NOT CMAKE_CROSSCOMPILING)
         add_executable(afcore_run tools/afcore_run/main.cpp)
-        target_include_directories(afcore_run PRIVATE include)
+        target_link_libraries(afcore_run PRIVATE afc::afcore)
         target_compile_definitions(afcore_run PRIVATE AFCORE_SET=${C2D_ROMSET})
         target_link_libraries(afcore_run PRIVATE afcore_${C2D_ROMSET} ${CMAKE_DL_LIBS})
+    endif()
+    # Out Run board: the native board with MAME's trace lines (tools/orun_trace;
+    # ORUN_SET=shangon or toutrun for those sets, the ROM set as a .zip)
+    if(C2D_BOARD STREQUAL "outrun" AND NOT CMAKE_CROSSCOMPILING)
+        set(HOOK "#define M68K_INSN_HOOK(pc) do { if (c.insns >= e.hook_at) e.on_hook(pc); } while (0)\n")
+        file(WRITE ${CMAKE_BINARY_DIR}/orun_trace_gen_main.cpp "${HOOK}#include \"${GEN_DIR}/gen_main.cpp\"\n")
+        file(WRITE ${CMAKE_BINARY_DIR}/orun_trace_gen_sub.cpp "${HOOK}#include \"${GEN_DIR}/gen_sub.cpp\"\n")
+        set(ORUN_TRACE_GEN ${CMAKE_BINARY_DIR}/orun_trace_gen_main.cpp ${CMAKE_BINARY_DIR}/orun_trace_gen_sub.cpp)
+        if(NOT MSVC)
+            set_source_files_properties(${ORUN_TRACE_GEN} PROPERTIES COMPILE_OPTIONS "-O1;-w")
+        endif()
+        add_executable(orun_trace tools/orun_trace/main.cpp ${ORUN_TRACE_GEN})
+        target_link_libraries(orun_trace PRIVATE outrun_board c2d_import)
+    endif()
+    # System 32 / Multi 32: the native board with the MAME oracle's lines
+    # (tools/s32_trace), on the same v60recomp output as the core
+    if(C2D_BOARD STREQUAL "system32" AND NOT CMAKE_CROSSCOMPILING)
+        add_executable(s32_trace tools/s32_trace/main.cpp ${GEN_SOURCES})
+        target_link_libraries(s32_trace PRIVATE system32_board c2d_import)
+    endif()
+    # Hang-On board: the native board with MAME's trace lines (tools/hang_trace)
+    if(C2D_BOARD STREQUAL "hangon" AND NOT CMAKE_CROSSCOMPILING)
+        # the recompiled code again, with the per-instruction trace hook
+        set(HOOK "#define M68K_INSN_HOOK(pc) do { if (c.insns >= e.hook_at) e.on_hook(pc); } while (0)\n")
+        file(WRITE ${CMAKE_BINARY_DIR}/hang_trace_gen_main.cpp "${HOOK}#include \"${GEN_DIR}/gen_main.cpp\"\n")
+        file(WRITE ${CMAKE_BINARY_DIR}/hang_trace_gen_sub.cpp "${HOOK}#include \"${GEN_DIR}/gen_sub.cpp\"\n")
+        set(HANG_TRACE_GEN ${CMAKE_BINARY_DIR}/hang_trace_gen_main.cpp ${CMAKE_BINARY_DIR}/hang_trace_gen_sub.cpp)
+        if(NOT MSVC)
+            set_source_files_properties(${HANG_TRACE_GEN} PROPERTIES COMPILE_OPTIONS "-O1;-w")
+        endif()
+        add_executable(hang_trace tools/hang_trace/main.cpp ${HANG_TRACE_GEN})
+        target_link_libraries(hang_trace PRIVATE hangon_board c2d_import)
+        if(C2D_ROMSET STREQUAL "sharrier")
+            target_compile_definitions(hang_trace PRIVATE C2D_SHARRIER)
+        elseif(C2D_ROMSET STREQUAL "enduror")
+            target_compile_definitions(hang_trace PRIVATE C2D_ENDUROR)
+        endif()
+    endif()
+    # X Board: the native board with MAME's trace lines (tools/xbd_trace;
+    # XBD_SET names a set other than aburner2)
+    if(C2D_BOARD STREQUAL "xboard" AND NOT CMAKE_CROSSCOMPILING)
+        set(HOOK "#define M68K_INSN_HOOK(pc) do { if (c.insns >= e.hook_at) e.on_hook(pc); } while (0)\n")
+        file(WRITE ${CMAKE_BINARY_DIR}/xbd_trace_gen_main.cpp "${HOOK}#include \"${GEN_DIR}/gen_main.cpp\"\n")
+        file(WRITE ${CMAKE_BINARY_DIR}/xbd_trace_gen_sub.cpp "${HOOK}#include \"${GEN_DIR}/gen_sub.cpp\"\n")
+        set(XBD_TRACE_GEN ${CMAKE_BINARY_DIR}/xbd_trace_gen_main.cpp ${CMAKE_BINARY_DIR}/xbd_trace_gen_sub.cpp)
+        if(NOT MSVC)
+            set_source_files_properties(${XBD_TRACE_GEN} PROPERTIES COMPILE_OPTIONS "-O1;-w")
+        endif()
+        add_executable(xbd_trace tools/xbd_trace/main.cpp ${XBD_TRACE_GEN})
+        target_link_libraries(xbd_trace PRIVATE xboard_board c2d_import)
+    endif()
+    # Y Board: the native board with MAME's trace lines (tools/ybd_trace;
+    # YBD_SET=pdrift for Power Drift)
+    if(C2D_BOARD STREQUAL "yboard" AND NOT CMAKE_CROSSCOMPILING)
+        set(HOOK "#define M68K_INSN_HOOK(pc) do { if (c.insns >= e.hook_at) e.on_hook(pc); } while (0)\n")
+        set(YBD_TRACE_GEN)
+        foreach(cpu main subx suby)
+            file(WRITE ${CMAKE_BINARY_DIR}/ybd_trace_gen_${cpu}.cpp "${HOOK}#include \"${GEN_DIR}/gen_${cpu}.cpp\"\n")
+            list(APPEND YBD_TRACE_GEN ${CMAKE_BINARY_DIR}/ybd_trace_gen_${cpu}.cpp)
+        endforeach()
+        if(NOT MSVC)
+            set_source_files_properties(${YBD_TRACE_GEN} PROPERTIES COMPILE_OPTIONS "-O1;-w")
+        endif()
+        add_executable(ybd_trace tools/ybd_trace/main.cpp ${YBD_TRACE_GEN})
+        target_link_libraries(ybd_trace PRIVATE yboard_board c2d_import)
     endif()
 elseif(C2D_CORE)
     message(STATUS "No recompiled code in ${GEN_DIR}: run scripts/recompile.py first (the core is not built)")

@@ -1,4 +1,4 @@
-// MAME's 68000 timing for one decoded instruction (docs/m68000-timing.md):
+// MAME's 68000 timing for one decoded instruction (docs/design/M68000.md):
 // the fixed cycle count, where its first data access falls, where it
 // samples the interrupt lines and when its device accesses happen. The
 // recompiler (tools/m68krecomp) writes these into the generated code; the
@@ -143,6 +143,8 @@ inline Yield yield_of(const Insn &in, unsigned cyc) {
     case Op::Unlk: case Op::Movem: case Op::Movep: case Op::Chk: case Op::Stop: case Op::Reset: case Op::Pea: case Op::Tas:
     case Op::Abcd: case Op::Sbcd: case Op::Nbcd: case Op::Addx: case Op::Subx: case Op::Cmpm:
     case Op::AndiCcr: case Op::OriCcr: case Op::EoriCcr: // np nn nn np np: the idle comes before two prefetches
+    case Op::AndiSr: case Op::OriSr: case Op::EoriSr:    // the same, as MAME's SR forms (Racing Hero takes
+    case Op::MoveToSr:                                     // a timer IRQ right after andi #$f8ff,sr and move d0,sr)
         return from_end(4);
     default: break;
     }

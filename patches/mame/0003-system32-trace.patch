@@ -1,14 +1,43 @@
-# V60/V70 and System 32 oracle for OutRunners and Rad Rally. Applies on top
-# of the Model 1/2 cores repo patch 0006-model1-v60-trace.patch (M1TRACE_*):
+# V60/V70 and System 32 oracle for OutRunners, Rad Rally, Rad Mobile and F1
+# Exhaust Note, Jurassic Park, SegaSonic and Golden Axe: The Revenge of
+# Death Adder. Applies on top of the Model 1/2 cores repo patch
+# 0006-model1-v60-trace.patch (M1TRACE_*):
 # adds M1TRACE_PCLOG_EVERY, M1TRACE_FRAMES (one line per screen 0 update, both
 # System 32 and Multi 32), M1TRACE_DUMP=DIR (each frame as DIR/f<n>.ppm) and
 # M1TRACE_REPLAY (input replay keyed on start_of_vblank_int; the format
-# s32_trace --replay reads).
+# s32_trace --replay reads). F1 Exhaust Note's second board ("subpcb")
+# writes M1TRACE_SUB_PCLOG, M1TRACE_SUB_PCS and M1TRACE_SUB_FRAMES, and its
+# replay ports are SUB_P1_A and so on; the main board steps the replay.
+# SegaSonic's trackballs replay as TRACKX1..TRACKY3 (12-bit counts) through
+# a hook in upd4701.cpp; EXTRA1-3 (the 4-player boards' 8255) replay too.
+# M1TRACE_V25_PCLOG writes the V25's every 256th instruction (PC and
+# registers; Golden Axe: The Revenge of Death Adder's protection CPU).
 # Build: make SUBTARGET=s32 SOURCES=src/mame/sega/segas32.cpp USE_QTDEBUG=0
 
 --- a/src/devices/cpu/v60/v60.cpp
 +++ b/src/devices/cpu/v60/v60.cpp
-@@ -449,6 +449,9 @@
+@@ -437,20 +437,30 @@
+ 		static const uint8_t ram_pages[][2] = { {0x00, 0x2f}, {0x40, 0x40}, {0x50, 0x53}, {0x60, 0x61}, {0x70, 0x70}, {0x78, 0x7f}, {0x90, 0x91}, {0xf8, 0xff} };
+ 		for (int i = 0; i < 256; i++) m_dev_page[i] = 1;
+ 		for (auto &r : ram_pages) for (int i = r[0]; i <= r[1]; i++) m_dev_page[i] = 0;
+-		const char *p = getenv("M1TRACE_LOG");
++		// a second board's CPU (f1en's "subpcb") traces to M1TRACE_SUB_*
++		const bool sub = strstr(tag(), "subpcb") != nullptr;
++		auto env = [sub](const char *n) -> const char * {
++			if (!sub) return getenv(n);
++			std::string k = std::string("M1TRACE_SUB_") + (n + 8);
++			return getenv(k.c_str());
++		};
++		const char *p = sub ? nullptr : getenv("M1TRACE_LOG");
+ 		if (p && *p)
+ 		{
+ 			m_trace = fopen(p, "wb");
+ 			if (m_trace) fwrite("M1TR\x01\0\0\0", 1, 8, m_trace);
+ 		}
+-		p = getenv("M1TRACE_PCLOG");
++		p = env("M1TRACE_PCLOG");
+ 		if (p && *p)
+ 		{
  			m_pc_log = fopen(p, "w");
  			const char *mx = getenv("M1TRACE_PCLOG_MAX");
  			m_pc_log_max = mx ? strtoull(mx, nullptr, 0) : 200000;
@@ -16,9 +45,12 @@
 +			const char *ev = getenv("M1TRACE_PCLOG_EVERY");
 +			m_pc_log_mask = ev ? strtoull(ev, nullptr, 0) - 1 : 0;
  		}
- 		p = getenv("M1TRACE_PCS");
+-		p = getenv("M1TRACE_PCS");
++		p = env("M1TRACE_PCS");
  		if (p && *p)
-@@ -672,7 +675,7 @@
+ 		{
+ 			m_pc_seen_path = p;
+@@ -672,7 +682,7 @@
  		{
  			if (!m_pc_seen.empty())
  				m_pc_seen[(m_PPC & 0xffffff) >> 6] |= uint64_t(1) << (m_PPC & 63);
@@ -40,11 +72,60 @@
  	void trace_sample();
  	void trace_rec(uint8_t type, const void *p, uint32_t n);
  
+diff --git a/src/devices/cpu/nec/v25.cpp b/src/devices/cpu/nec/v25.cpp
+index ca5dca797f..345fb1675c 100644
+--- a/src/devices/cpu/nec/v25.cpp
++++ b/src/devices/cpu/nec/v25.cpp
+@@ -1195,6 +1195,14 @@ void v25_common_device::execute_run()
+ 			m_no_interrupt--;
+ 
+ 		debugger_instruction_hook((Sreg(PS)<<4) + m_ip);
++		{
++			// M1TRACE_V25_PCLOG: every 256th instruction's PC and registers
++			static FILE *pclog = getenv("M1TRACE_V25_PCLOG") ? fopen(getenv("M1TRACE_V25_PCLOG"), "w") : nullptr;
++			static uint64_t n = 0;
++			if (pclog && (n++ & 255) == 0)
++				fprintf(pclog, "%llu %05x %04x %04x %04x %04x %04x %04x\n", (unsigned long long)n - 1, (Sreg(PS)<<4) + m_ip,
++						Wreg(AW), Wreg(CW), Wreg(DW), Wreg(BW), Wreg(SP), CompressFlags());
++		}
+ 		m_cur_cycles = 0;
+ 
+ 		if (m_rep_params)
+diff --git a/src/devices/machine/upd4701.cpp b/src/devices/machine/upd4701.cpp
+index 728c7e5e2e..065a6cef06 100644
+--- a/src/devices/machine/upd4701.cpp
++++ b/src/devices/machine/upd4701.cpp
+@@ -213,17 +213,23 @@ void upd4701_device::reset_xy_w(u8 data)
+ //  update - per-frame input update
+ //-------------------------------------------------
+ 
++// attract-mode-cores: replayed counts (segas32's M1TRACE_REPLAY TRACKX1 ...):
++// -1 reads the port
++int (*g_upd4701_track)(const char *tag, int axis) = nullptr;
++
+ void upd4701_device::update()
+ {
++	const int ovx = g_upd4701_track ? g_upd4701_track(tag(), 0) : -1;
++	const int ovy = g_upd4701_track ? g_upd4701_track(tag(), 1) : -1;
+ 	if (m_portx.found())
+ 	{
+-		u16 x = m_portx->read() & MASK_COUNTER;
++		u16 x = (ovx >= 0 ? u16(ovx) : m_portx->read()) & MASK_COUNTER;
+ 		x_add(x - m_last_x_read);
+ 		m_last_x_read = x;
+ 	}
+ 	if (m_porty.found())
+ 	{
+-		u16 y = m_porty->read() & MASK_COUNTER;
++		u16 y = (ovy >= 0 ? u16(ovy) : m_porty->read()) & MASK_COUNTER;
+ 		y_add(y - m_last_y_read);
+ 		m_last_y_read = y;
+ 	}
 diff --git a/src/mame/sega/segas32.cpp b/src/mame/sega/segas32.cpp
-index e987382737..6cb50be809 100644
+index e987382737..2d3221e3ee 100644
 --- a/src/mame/sega/segas32.cpp
 +++ b/src/mame/sega/segas32.cpp
-@@ -800,8 +800,61 @@ TIMER_CALLBACK_MEMBER(segas32_state::end_of_vblank_int)
+@@ -800,8 +800,86 @@ TIMER_CALLBACK_MEMBER(segas32_state::end_of_vblank_int)
  }
  
  
@@ -53,7 +134,20 @@ index e987382737..6cb50be809 100644
 +// hex; '#' starts a comment). From start_of_vblank_int number VBL (counting
 +// from 0), before its IRQ, the port reads VALUE (SERVICE34 bit 7 stays the
 +// EEPROM). The native s32_trace reads the same file.
-+static int g_s32_ov[18] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
++// a second board (f1en's "subpcb") reads ports prefixed SUB_ (SUB_P1_A ...);
++// 36-41 the trackball counts TRACKX1 TRACKY1 ... TRACKY3 (12 bits, the
++// value the port reads; sonic's uPD4701s take them at each frame update)
++// 42-44 EXTRA1-EXTRA3 (the 4-player boards' 8255)
++static int g_s32_ov[45] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++		-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
++		-1, -1, -1, -1, -1, -1, -1, -1, -1 };
++extern int (*g_upd4701_track)(const char *tag, int axis);
++static int s32trace_track(const char *tag, int axis)
++{
++	const char *u = strstr(tag, "upd");
++	if (!u || u[3] < '1' || u[3] > '3') return -1;
++	return g_s32_ov[36 + (u[3] - '1') * 2 + axis];
++}
 +struct s32_replay_ev { u64 vbl; int port; int value; };
 +static std::vector<s32_replay_ev> g_s32_replay;
 +static size_t g_s32_replay_pos = 0;
@@ -74,10 +168,20 @@ index e987382737..6cb50be809 100644
 +				{
 +					unsigned long long u; char name[32]; unsigned v;
 +					if (line[0] == '#' || sscanf(line, "%llu %31s %x", &u, name, &v) != 3) continue;
++					static const char *const tracks[6] = { "TRACKX1", "TRACKY1", "TRACKX2", "TRACKY2", "TRACKX3", "TRACKY3" };
++					for (int i = 0; i < 6; i++)
++						if (!strcmp(name, tracks[i])) g_s32_replay.push_back({ u, 36 + i, int(v & 0xfff) });
++					static const char *const extras[3] = { "EXTRA1", "EXTRA2", "EXTRA3" };
++					for (int i = 0; i < 3; i++)
++						if (!strcmp(name, extras[i])) g_s32_replay.push_back({ u, 42 + i, int(v & 0xff) });
 +					for (int i = 0; i < 18; i++)
++					{
 +						if (!strcmp(name, names[i])) g_s32_replay.push_back({ u, i, int(v & 0xff) });
++						if (!strncmp(name, "SUB_", 4) && !strcmp(name + 4, names[i])) g_s32_replay.push_back({ u, 18 + i, int(v & 0xff) });
++					}
 +				}
 +				fclose(f);
++				g_upd4701_track = s32trace_track;
 +			}
 +	}
 +	for (; g_s32_replay_pos < g_s32_replay.size() && g_s32_replay[g_s32_replay_pos].vbl <= g_s32_vbl; g_s32_replay_pos++)
@@ -89,24 +193,26 @@ index e987382737..6cb50be809 100644
 +{
 +	ioport_port *const p = ioport(tag);
 +	u8 v = p ? u8(p->read()) : 0xff;
-+	if (g_s32_ov[idx] >= 0)
-+		v = (idx == 4 || idx == 9) ? u8((v & 0x80) | (g_s32_ov[idx] & 0x7f)) : u8(g_s32_ov[idx]);
++	const int o = idx + (strstr(this->tag(), "subpcb") ? 18 : 0);
++	if (g_s32_ov[o] >= 0)
++		v = (idx == 4 || idx == 9) ? u8((v & 0x80) | (g_s32_ov[o] & 0x7f)) : u8(g_s32_ov[o]);
 +	return v;
 +}
 +
 +template <int N> ioport_value segas32_state::trace_analog()
 +{
 +	static const char *const tags[8] = { "ANALOG1", "ANALOG2", "ANALOG3", "ANALOG4", "ANALOG5", "ANALOG6", "ANALOG7", "ANALOG8" };
-+	return g_s32_ov[10 + N] >= 0 ? ioport_value(g_s32_ov[10 + N]) : (ioport(tags[N]) ? ioport(tags[N])->read() : 0);
++	const int o = 10 + N + (strstr(tag(), "subpcb") ? 18 : 0);
++	return g_s32_ov[o] >= 0 ? ioport_value(g_s32_ov[o]) : (ioport(tags[N]) ? ioport(tags[N])->read() : 0);
 +}
 +
  INTERRUPT_GEN_MEMBER(segas32_state::start_of_vblank_int)
  {
-+	s32trace_replay_step();
++	if (!strstr(tag(), "subpcb")) s32trace_replay_step();
  	signal_v60_irq(MAIN_IRQ_VBSTART);
  	system32_set_vblank(1);
  	m_vblank_end_int_timer->adjust(m_screen->time_until_pos(0));
-@@ -2261,15 +2314,15 @@ void segas32_state::device_add_mconfig(machine_config &config)
+@@ -2261,15 +2339,15 @@ void segas32_state::device_add_mconfig(machine_config &config)
  	m_soundcpu->set_addrmap(AS_IO, &segas32_state::system32_sound_portmap);
  
  	sega_315_5296_device &io_chip(SEGA_315_5296(config, "io_chip", MAIN_CLOCK/4));
@@ -127,7 +233,7 @@ index e987382737..6cb50be809 100644
  	io_chip.out_pg_callback().set(FUNC(segas32_state::sw2_output_0_w));
  	io_chip.out_ph_callback().set(FUNC(segas32_state::tilebank_external_w));
  	io_chip.out_cnt1_callback().set(FUNC(segas32_state::display_enable_w<0>));
-@@ -2333,10 +2386,10 @@ void segas32_analog_state::device_add_mconfig(machine_config &config)
+@@ -2333,10 +2411,10 @@ void segas32_analog_state::device_add_mconfig(machine_config &config)
  	m_maincpu->set_addrmap(AS_PROGRAM, &segas32_analog_state::system32_analog_map);
  
  	msm6253_device &adc(MSM6253(config, "adc"));
@@ -142,7 +248,20 @@ index e987382737..6cb50be809 100644
  }
  
  DEFINE_DEVICE_TYPE(SEGA_S32_ANALOG_DEVICE, segas32_analog_state, "segas32_pcb_analog", "Sega System 32 analog PCB")
-@@ -2561,24 +2614,24 @@ void sega_multi32_state::device_add_mconfig(machine_config &config)
+@@ -2407,9 +2485,9 @@ void segas32_4player_state::device_add_mconfig(machine_config &config)
+ 	m_maincpu->set_addrmap(AS_PROGRAM, &segas32_4player_state::system32_4player_map);
+ 
+ 	i8255_device &ppi(I8255A(config, "ppi"));
+-	ppi.in_pa_callback().set_ioport("EXTRA1");
+-	ppi.in_pb_callback().set_ioport("EXTRA2");
+-	ppi.in_pc_callback().set_ioport("EXTRA3");
++	ppi.in_pa_callback().set([this] () { return trace_in(42, "EXTRA1"); });
++	ppi.in_pb_callback().set([this] () { return trace_in(43, "EXTRA2"); });
++	ppi.in_pc_callback().set([this] () { return trace_in(44, "EXTRA3"); });
+ }
+ 
+ DEFINE_DEVICE_TYPE(SEGA_S32_4PLAYER_DEVICE, segas32_4player_state, "segas32_pcb_4player", "Sega System 32 4-player/fighting PCB")
+@@ -2561,24 +2639,24 @@ void sega_multi32_state::device_add_mconfig(machine_config &config)
  	m_soundcpu->set_addrmap(AS_IO, &sega_multi32_state::multi32_sound_portmap);
  
  	sega_315_5296_device &io_chip_0(SEGA_315_5296(config, "io_chip_0", MAIN_CLOCK/4));
@@ -177,7 +296,7 @@ index e987382737..6cb50be809 100644
  	io_chip_1.out_pg_callback().set(FUNC(segas32_state::sw2_output_1_w));
  	io_chip_1.out_ph_callback().set("eeprom", FUNC(eeprom_serial_93cxx_device::di_write)).bit(7);
  	io_chip_1.out_ph_callback().append("eeprom", FUNC(eeprom_serial_93cxx_device::cs_write)).bit(5);
-@@ -2655,20 +2708,20 @@ void sega_multi32_analog_state::device_add_mconfig(machine_config &config)
+@@ -2655,20 +2733,20 @@ void sega_multi32_analog_state::device_add_mconfig(machine_config &config)
  	m_maincpu->set_addrmap(AS_PROGRAM, &sega_multi32_analog_state::multi32_analog_map);
  
  	msm6253_device &adc(MSM6253(config, "adc"));
@@ -217,10 +336,10 @@ index e7dbed2d8e..30acf8486f 100644
  	uint32_t screen_update_multi32_right(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
  
 diff --git a/src/mame/sega/segas32_v.cpp b/src/mame/sega/segas32_v.cpp
-index 873bc5e708..b5c1b0ade3 100644
+index 873bc5e708..5ac17815db 100644
 --- a/src/mame/sega/segas32_v.cpp
 +++ b/src/mame/sega/segas32_v.cpp
-@@ -2199,6 +2199,49 @@ void segas32_state::print_mixer_data(int which)
+@@ -2199,6 +2199,53 @@ void segas32_state::print_mixer_data(int which)
  	}
  }
  
@@ -229,13 +348,17 @@ index 873bc5e708..b5c1b0ade3 100644
 +void segas32_state::trace_frame(bitmap_rgb32 &bitmap, const rectangle &cliprect)
 +{
 +	{
-+		static FILE *f = nullptr;
-+		static bool init = false;
-+		static uint64_t frame = 0;
-+		if (!init)
++		// a second board (f1en's "subpcb"): M1TRACE_SUB_FRAMES, no dumps
++		const int sub = strstr(tag(), "subpcb") ? 1 : 0;
++		static FILE *fs[2] = { nullptr, nullptr };
++		static bool inits[2] = { false, false };
++		static uint64_t frames[2] = { 0, 0 };
++		FILE *&f = fs[sub];
++		uint64_t &frame = frames[sub];
++		if (!inits[sub])
 +		{
-+			init = true;
-+			if (const char *p = getenv("M1TRACE_FRAMES")) f = fopen(p, "w");
++			inits[sub] = true;
++			if (const char *p = getenv(sub ? "M1TRACE_SUB_FRAMES" : "M1TRACE_FRAMES")) f = fopen(p, "w");
 +		}
 +		if (f)
 +		{
@@ -247,7 +370,7 @@ index 873bc5e708..b5c1b0ade3 100644
 +					(unsigned long long)m_soundcpu->total_cycles(), cliprect.min_x, cliprect.max_x, (unsigned long long)h);
 +			fflush(f);
 +			// M1TRACE_DUMP=DIR writes every frame as DIR/f<frame>.ppm
-+			if (const char *d = getenv("M1TRACE_DUMP"))
++			if (const char *d = sub ? nullptr : getenv("M1TRACE_DUMP"))
 +			{
 +				char name[512];
 +				snprintf(name, sizeof(name), "%s/f%llu.ppm", d, (unsigned long long)(frame - 1));
@@ -270,7 +393,7 @@ index 873bc5e708..b5c1b0ade3 100644
  uint32_t segas32_state::screen_update_system32(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
  {
  	uint8_t enablemask;
-@@ -2238,6 +2281,8 @@ uint32_t segas32_state::screen_update_system32(screen_device &screen, bitmap_rgb
+@@ -2238,6 +2285,8 @@ uint32_t segas32_state::screen_update_system32(screen_device &screen, bitmap_rgb
  		mix_all_layers(0, 0, bitmap, cliprect, enablemask);
  	}
  
@@ -279,7 +402,7 @@ index 873bc5e708..b5c1b0ade3 100644
  	if (LOG_SPRITES && machine().input().code_pressed(KEYCODE_L))
  	{
  		const rectangle &visarea = screen.visible_area();
-@@ -2418,6 +2463,9 @@ uint32_t segas32_state::multi32_update(screen_device &screen, bitmap_rgb32 &bitm
+@@ -2418,6 +2467,9 @@ uint32_t segas32_state::multi32_update(screen_device &screen, bitmap_rgb32 &bitm
  		mix_all_layers(index, 0, bitmap, cliprect, enablemask);
  	}
  

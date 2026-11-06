@@ -3,9 +3,9 @@
 
   recompile.py --set SET --rom ROMSET [--build-dir DIR] [--core | --gen-only] [--jobs N]
 
-SET is outrun, shangon, toutrun, aburner2, thndrbld, thndrbld1, orunners or radr. Builds the host tools (CMake, in DIR), checks the
+SET is one of games.toml's sets. Builds the host tools (CMake, in DIR), checks the
 set and writes the 68000 program images (c2d_import), translates them (m68krecomp, seeded with
-seeds/<set>.main and seeds/<set>.sub, plus the jump tables and handler
+seeds/<set>.main and seeds/<set>.sub (Y Board: .main, .subx, .suby), plus the jump tables and handler
 pointers it finds in the program) into DIR/gen/<set>/, then with --core
 builds the core library afcore_<set> (a framework on macOS). Everything it
 writes is derived from the ROMs: keep DIR under build/ (git-ignored).
@@ -18,7 +18,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETS = {"outrun": "orun", "shangon": "orun", "toutrun": "orun", "aburner2": "xbd", "thndrbld": "xbd", "thndrbld1": "xbd", "orunners": "s32", "radr": "s32"}  # set -> generated code namespace prefix
+from game_sets import SETS  # set -> generated code namespace prefix (games.toml)
 
 
 def run(cmd):
@@ -62,9 +62,13 @@ def main():
         return
     # an FD1094 set's states come with its seeds (seeds/<set>.main)
     run([exe("c2d_import"), s, os.path.abspath(args.rom), images, os.path.join(ROOT, "seeds", f"{s}.main")])
-    for cpu in ("main", "sub"):
+    # the Y Board's three 68000s run as MAME's Musashi core runs them
+    cpus = ("main", "subx", "suby") if SETS[s] == "ybd" else ("main", "sub")
+    for cpu in cpus:
         cmd = [exe("m68krecomp"), os.path.join(images, f"{s}_{cpu}.bin"), os.path.join(gen, f"gen_{cpu}.cpp"),
                "--ns", f"{SETS[s]}_{cpu}", "--seeds", os.path.join(ROOT, "seeds", f"{s}.{cpu}"), "--pointers", "--scan"]
+        if SETS[s] == "ybd":
+            cmd.append("--musashi")
         op = os.path.join(images, f"{s}_{cpu}_op.bin")
         if os.path.exists(op):
             cmd += ["--opcodes", op]

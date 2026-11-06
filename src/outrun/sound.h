@@ -27,10 +27,21 @@ struct StreamClock {
     uint64_t index_at(sched::attotime now) const;
 };
 
-// 315-5218 (segapcm_device<16>, BANK_512)
+// 315-5218 (segapcm_device<16>, BANK_512), or with discrete = true the
+// Hang-On board's segapcm_discrete_device (8 voices, no banking, registers
+// at 0x42-0x47 and 0xc4-0xc6 of each 8-byte group)
+// The 315-5218's ROM banking (sega_315_5218_device::set_bank): BANK_512
+// with the default mask on Out Run and the X Board; the Y Board's
+// BANK_12M | BANK_MASKF8 reads a 0x200000 region.
+struct PcmBank {
+    int shift = 12, mask = 0x70;
+    uint32_t size = 0x80000;
+};
+
 class SegaPcm {
 public:
-    explicit SegaPcm(std::vector<uint8_t> rom);
+    explicit SegaPcm(std::vector<uint8_t> rom, bool discrete = false, PcmBank bank = {});
+    int voices() const { return discrete_ ? 8 : 16; }
     void reset_ram() { ram.fill(0xff); }
     uint8_t read(uint8_t offset);
     void write(uint8_t offset, uint8_t data);
@@ -47,18 +58,25 @@ private:
     };
     void tick(Voice &v);
     std::vector<uint8_t> rom_;
+    bool discrete_ = false;
+    PcmBank bank_;
     Voice voice_[16];
 };
 
 class Sound : public z80::Bus, public ymfm::ymfm_interface {
 public:
-    Sound(sched::Scheduler &s, std::vector<uint8_t> rom, std::vector<uint8_t> pcm_rom);
+    // has_ym false: Super Monaco GP's second sound board (soundcpu2: the
+    // same Z80 map with its own 315-5218, port 0x40 only, no YM2151)
+    // clock: the Z80's, the YM2151's and the 315-5218's (Out Run and the X
+    // Board 4 MHz, the Y Board 32.2159 MHz / 8)
+    Sound(sched::Scheduler &s, std::vector<uint8_t> rom, std::vector<uint8_t> pcm_rom, const char *cpu_name = "soundcpu",
+          bool has_ym = true, uint32_t clock = 4'000'000, PcmBank bank = {});
     ~Sound() override;
 
     z80::Z80 &cpu() { return *cpu_; }
     void power_on();
     void update_streams() {
-        ym_update();
+        if (has_ym_) ym_update();
         pcm_update();
     }
 
@@ -107,6 +125,8 @@ private:
     sched::Timer *ym_timer_[2]{};
     sched::attotime busy_end_;
     uint8_t to_sound_ = 0, from_sound_ = 0;
+    bool has_ym_ = true;
+    uint32_t clock_ = 4'000'000;
 };
 
 } // namespace orun

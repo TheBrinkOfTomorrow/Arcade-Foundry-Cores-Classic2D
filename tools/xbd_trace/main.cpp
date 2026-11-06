@@ -83,11 +83,16 @@ int main(int argc, char **argv) {
     }
     xbd::Roms roms;
     try {
-        // XBD_SET=thndrbld or thndrbld1: that set (default aburner2)
+        // XBD_SET=aburner131, thndrbld, thndrbld1, rachero, smgp, loffire or gprider: that set (default aburner2)
         xbd::Game g = xbd::Game::aburner2;
         if (const char *set = std::getenv("XBD_SET")) {
             if (!std::strcmp(set, xbd::kThndrbldRomSet)) g = xbd::Game::thndrbld;
             else if (!std::strcmp(set, xbd::kThndrbld1RomSet)) g = xbd::Game::thndrbld1;
+            else if (!std::strcmp(set, xbd::kAburner131RomSet)) g = xbd::Game::aburner131;
+            else if (!std::strcmp(set, xbd::kRacheroRomSet)) g = xbd::Game::rachero;
+            else if (!std::strcmp(set, xbd::kSmgpRomSet)) g = xbd::Game::smgp;
+            else if (!std::strcmp(set, xbd::kLoffireRomSet)) g = xbd::Game::loffire;
+            else if (!std::strcmp(set, xbd::kGpriderRomSet)) g = xbd::Game::gprider;
         }
         roms = xbd::import_rom_set(argv[1], g);
     } catch (const std::exception &e) {

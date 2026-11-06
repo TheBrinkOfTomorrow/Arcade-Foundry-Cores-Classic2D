@@ -68,4 +68,91 @@ template <unsigned S = 1, class C> inline uint32_t sbcd(C &c, uint32_t s, uint32
     return r;
 }
 
+// The same as MAME's Musashi 68000 computes them (m68k_in.lst abcd, sbcd,
+// nbcd, divu, divs), for the boards on that core (--musashi): its own
+// undefined N and V, NBCD's X/C clear on a zero result, and DIVU/DIVS
+// leaving N and Z on an overflow (DIVS 0x80000000 / -1 gives 0).
+template <unsigned S = 1, class C> inline uint32_t abcd_musashi(C &c, uint32_t s, uint32_t d) {
+    uint32_t res = (s & 0x0f) + (d & 0x0f) + c.x;
+    const uint32_t corf = res > 9 ? 6 : 0;
+    res += (s & 0xf0) + (d & 0xf0);
+    uint32_t v = ~res;
+    res += corf;
+    c.x = c.c = res > 0x9f ? 1 : 0;
+    if (c.c) res -= 0xa0;
+    v &= res;
+    c.v = (v >> 7) & 1;
+    c.n = (res >> 7) & 1;
+    res &= 0xff;
+    if (res) c.z = 0;
+    return res;
+}
+template <unsigned S = 1, class C> inline uint32_t sbcd_musashi(C &c, uint32_t s, uint32_t d) {
+    uint32_t res = (d & 0x0f) - (s & 0x0f) - c.x;
+    const uint32_t corf = res > 0xf ? 6 : 0;
+    res += (d & 0xf0) - (s & 0xf0);
+    uint32_t v = res;
+    if (res > 0xff) {
+        res += 0xa0;
+        c.x = c.c = 1;
+    } else if (res < corf)
+        c.x = c.c = 1;
+    else
+        c.n = c.x = c.c = 0;
+    res = (res - corf) & 0xff;
+    v &= ~res;
+    c.v = (v >> 7) & 1;
+    c.n = (res >> 7) & 1;
+    if (res) c.z = 0;
+    return res;
+}
+template <class C> inline uint32_t nbcd_musashi(C &c, uint32_t d) {
+    d &= 0xff;
+    uint32_t res = 0u - d - c.x;
+    if (res != 0) {
+        uint32_t v = res;
+        if (((res | d) & 0x0f) == 0) res = (res & 0xf0) | 6;
+        res = (res + 0x9a) & 0xff;
+        v &= ~res;
+        c.v = (v >> 7) & 1;
+        if (res) c.z = 0;
+        c.c = c.x = 1;
+    } else {
+        c.v = c.c = c.x = 0;
+    }
+    c.n = (res >> 7) & 1;
+    return res & 0xff;
+}
+template <class C> inline void divu_musashi(C &c, uint32_t &r, uint32_t src) {
+    src &= 0xffff;
+    c.c = 0;
+    const uint32_t q = r / src, m = r % src;
+    if (q < 0x10000) {
+        c.z = q == 0;
+        c.n = (q >> 15) & 1;
+        c.v = 0;
+        r = (m << 16) | q;
+    } else
+        c.v = 1;
+}
+template <class C> inline void divs_musashi(C &c, uint32_t &r, uint32_t src) {
+    const int32_t sv = int16_t(src);
+    c.c = 0;
+    if (r == 0x80000000u && sv == -1) {
+        c.z = 1;
+        c.n = 0;
+        c.v = 0;
+        r = 0;
+        return;
+    }
+    const int32_t q = int32_t(r) / sv, m = int32_t(r) % sv;
+    if (q == int16_t(q)) {
+        c.z = (q & 0xffff) == 0;
+        c.n = (q >> 15) & 1;
+        c.v = 0;
+        r = (uint32_t(m) << 16) | (uint32_t(q) & 0xffff);
+    } else
+        c.v = 1;
+}
+
 } // namespace m68k

@@ -9,8 +9,10 @@
 #pragma once
 
 #include "runtime/eeprom93c46.h"
+#include "runtime/i8255.h"
 #include "runtime/multipcm.h"
 #include "runtime/rf5c68.h"
+#include "runtime/v25/v25.h"
 #include "sched/scheduler.h"
 #include "system32/v60_exec.h"
 #include "system32/video.h"
@@ -39,6 +41,23 @@ struct Roms {
     std::vector<uint8_t> sprites; // ROM_REGION32_BE: big-endian dwords
     std::vector<uint8_t> pcm;     // MultiPCM samples, 0x400000 (Multi 32 only)
     std::vector<uint8_t> eeprom;  // the EEPROM's initial 128 bytes, if the set has them
+    // ANALOG1-8 at rest (the input ports' defaults): wheel centred, pedals
+    // up; Jurassic Park's two guns centred
+    std::array<uint8_t, 8> analog_rest{0x80, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00};
+    // segas32_trackball_state (SegaSonic): three uPD4701As at c00040-c00057
+    // in place of the analog board's MSM6253
+    bool trackball = false;
+    // init_sonic: the level-load protection's write handler at 20e5c4
+    bool sonic_protection = false;
+    // segas32_4player_state: an 8255 at c00060-c00067 reads EXTRA1-3
+    // (players 3 and 4, their starts)
+    bool four_player = false;
+    // segas32_v25_state (Golden Axe: The Revenge of Death Adder): the V25
+    // protection CPU's 64 KiB ROM (address lines unscrambled, as MAME's
+    // decrypt_protrom leaves it) and its opcode table; it shares an MB8421
+    // with the V60 at a00000
+    std::vector<uint8_t> mcu;
+    const uint8_t *mcu_opcodes = nullptr;
 };
 
 // Input ports (MAME's defaults for orunners). Active low unless noted.
@@ -54,6 +73,27 @@ struct Inputs {
     // ANALOG1-8 (active high): 1 wheel, 2 gas, 3 brake (player 1); 4 wheel,
     // 7 gas, 8 brake (player 2)
     uint8_t analog[8] = {0x80, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00};
+    // TRACKX1, TRACKY1 ... TRACKY3: each trackball's 12-bit position (the
+    // ports' values; the counters take the change at each frame)
+    uint16_t track[6] = {};
+    // EXTRA1, EXTRA2 (players 3 and 4: D0-D2 buttons, D4-D7 down, up,
+    // right, left), EXTRA3 (D0 start 3, D1 start 4); active low
+    uint8_t extra[3] = {0xff, 0xff, 0xff};
+};
+
+// uPD4701A incremental encoder counter (MAME's upd4701_device), as the
+// trackball board uses it: read_xy, reset_xy_w and the per-frame update
+struct Upd4701 {
+    static constexpr uint16_t kMask = 0xfff;
+    bool cs = true, xy = false, ul = false, resetx = false, resety = false, cf = true;
+    int16_t latchx = 0, latchy = 0, startx = 0, starty = 0, x = 0, y = 0;
+    uint16_t last_x_read = 0, last_y_read = 0;
+    uint8_t switches = 0, latchswitches = 0;
+    void cs_w(bool state);
+    uint8_t d_r() const;
+    uint8_t read_xy(int offset);
+    void reset_xy_w();
+    void update(uint16_t px, uint16_t py); // MACHINE_NOTIFY_FRAME
 };
 
 // 315-5296 I/O chip
@@ -88,10 +128,27 @@ private:
     sched::attotime busy_end_;
 };
 
+// F1 Exhaust Note's two boards (segas32_new_state's dual_pcb_comms): 4 KiB
+// of shared RAM at 810000 (0xff at power on), 818000 reads 0 on the main
+// board and 1 on the sub board; one machine, so one random number source
+struct DualLink {
+    std::array<uint16_t, 0x800> comms;
+    uint32_t rand_seed = 0x9d14abd7;
+    DualLink() { comms.fill(0xffff); }
+};
+
 class Board : public v60::Bus, public z80::Bus {
 public:
     using RunFn = V60Exec::RunFn;
-    Board(Roms roms, RunFn run);
+    // shared: another board's scheduler (both boards in one machine: the
+    // second's devices come after the first's)
+    Board(Roms roms, RunFn run, sched::Scheduler *shared = nullptr);
+    // join a DualLink as board id (0 main, 1 sub)
+    void attach_dual(std::shared_ptr<DualLink> link, int id) {
+        dual_ = std::move(link);
+        dual_id_ = uint16_t(id);
+        rand_seed_p_ = &dual_->rand_seed;
+    }
     ~Board() override;
 
     Inputs inputs;
@@ -105,6 +162,7 @@ public:
 
     V60Exec &main() { return *main_; }
     z80::Z80 &soundcpu() { return *z80_; }
+    v25::V25 *mcu() { return mcu_.get(); }
     Video &video() { return *video_; }
     sched::Scheduler &scheduler() { return sched_; }
 
@@ -174,7 +232,8 @@ private:
     void pcm_update();
 
     Roms roms_;
-    sched::Scheduler sched_;
+    std::unique_ptr<sched::Scheduler> own_sched_;
+    sched::Scheduler &sched_;
     std::unique_ptr<V60Exec> main_;
     std::unique_ptr<z80::Z80> z80_;
     std::unique_ptr<Video> video_;
@@ -185,6 +244,11 @@ private:
     Io5296 io_[2];
     rt::Eeprom93c46 eeprom_dev_{eeprom, eeprom_dirty};
     uint8_t adc_shift_ = 0, analog_bank_ = 0;
+    Upd4701 upd_[3];
+    rt::I8255 ppi_;
+    std::unique_ptr<v25::V25> mcu_;
+    std::array<uint8_t, 0x800> dpram_{}; // MB8421 (2K x 8)
+    void sonic_level_load_protection(uint16_t data, uint16_t mem_mask);
 
     uint8_t v60_irq_control_[16]{};
     sched::Timer *irq_timer_[2]{};
@@ -207,6 +271,9 @@ private:
     void comm_send_data(uint8_t type, int start, int size);
 
     uint32_t rand_seed_ = 0x9d14abd7;
+    uint32_t *rand_seed_p_ = &rand_seed_;
+    std::shared_ptr<DualLink> dual_;
+    uint16_t dual_id_ = 0;
 
     // screen (set_refresh_hz(60), 416x262, 224 visible lines)
     attoseconds_t frame_period_, scantime_, pixeltime_, vblank_period_;

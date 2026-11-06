@@ -68,6 +68,29 @@ Video::Video(VideoRoms roms, VideoConfig cfg, VideoView view) : cfg_(cfg), v_(vi
             }
         }
 
+    if (cfg_.hangon) {
+        zoom_ = std::move(roms.zoom);
+        zoom_.resize(0x2000, 0);
+        // segaic16_road_hangon_decode
+        const int hlen = int(roms.road.size());
+        hangon_road_gfx_.assign(256 * 512, 0);
+        for (int y = 0; y < 256 && hlen; ++y) {
+            const uint8_t *src = roms.road.data() + ((y & 0xff) * 0x40) % hlen;
+            uint8_t *dst = hangon_road_gfx_.data() + y * 512;
+            for (int x = 0; x < 512; ++x)
+                dst[x] = uint8_t(((src[x >> 3] >> (~x & 7)) & 1) << 0 | ((src[(x >> 3) + 0x4000] >> (~x & 7)) & 1) << 1);
+        }
+    }
+    if (cfg_.sharrier) {
+        // ROM_REGION32_LE sprites: 0x8000 words per bank
+        hangon_sprite_banks_ = int(roms.sprites.size() / 0x20000);
+    } else if (cfg_.hangon) {
+        // ROM_REGION16_BE sprites: 0x8000 words per bank
+        hangon_sprite_banks_ = int(roms.sprites.size() / 0x10000);
+        sprite_rom16_.resize(roms.sprites.size() / 2);
+        for (size_t i = 0; i < sprite_rom16_.size(); ++i) sprite_rom16_[i] = uint16_t(roms.sprites[i * 2] << 8 | roms.sprites[i * 2 + 1]);
+        roms.sprites.clear();
+    }
     roms.sprites.resize(cfg_.xboard ? 0x200000 : 0x100000, 0);
     if (cfg_.sys16b_sprites) {
         sprite_rom16_.resize(roms.sprites.size() / 2);
@@ -110,6 +133,21 @@ Video::Video(VideoRoms roms, VideoConfig cfg, VideoView view) : cfg_(cfg), v_(vi
 
 uint32_t Video::rgb(uint16_t index) const {
     const uint16_t n = cfg_.palette_entries;
+    if (cfg_.hangon) {
+        // hangon_paletteram_w: normal, shadow and hilight banks
+        // (sharrier: paletteram_w, normal and shadow/hilight)
+        const int banks = cfg_.sharrier ? 2 : 3;
+        if (index >= banks * n) return 0;
+        // device_palette_interface::allocate_palette: a standard rainbow
+        // until the pen is first written
+        if (v_.pal_written && !v_.pal_written[index % n])
+            return (index & 1 ? 0xff0000u : 0) | (index & 2 ? 0x00ff00u : 0) | (index & 4 ? 0x0000ffu : 0);
+        const uint16_t v = be16(v_.palette, index % n);
+        const int r = ((v >> 12) & 1) | ((v << 1) & 0x1e), g = ((v >> 13) & 1) | ((v >> 3) & 0x1e), bl = ((v >> 14) & 1) | ((v >> 7) & 0x1e);
+        const uint8_t *t = index < n ? pal_normal_ : index < 2 * n ? pal_shadow_ : pal_hilight_;
+        if (cfg_.sharrier && index >= n) t = (v & 0x8000) ? pal_hilight_ : pal_shadow_;
+        return uint32_t(t[r]) << 16 | uint32_t(t[g]) << 8 | t[bl];
+    }
     if (index >= 2 * n) return 0; // the black pen
     const uint16_t v = be16(v_.palette, index & (n - 1));
     const int r = ((v >> 12) & 1) | ((v << 1) & 0x1e), g = ((v >> 13) & 1) | ((v >> 3) & 0x1e), bl = ((v >> 14) & 1) | ((v >> 7) & 0x1e);
@@ -441,6 +479,10 @@ void Video::draw_sys16b_sprites(int min_y, int max_y) {
 // ---- screen_update_outrun / screen_update_shangon / segaxbd_state::screen_update ----
 
 void Video::update(int min_y, int max_y) {
+    if (cfg_.hangon) {
+        update_hangon(min_y, max_y);
+        return;
+    }
     // screen_update_shangon draws whatever the display enable says
     if (!cfg_.sys16b_mixer && !*v_.display_enable) {
         for (int y = min_y; y <= max_y; ++y) std::fill_n(&bitmap[size_t(y) * kWidth], kWidth, black_pen());
@@ -471,6 +513,305 @@ void Video::update(int min_y, int max_y) {
                 const bool shadow = cfg_.sys16b_mixer ? (pix & 0x03f0) == 0x03f0 : (pix & 0x400f) == 0x400a;
                 if (shadow) dest[x] = uint16_t(dest[x] + cfg_.palette_entries);
                 else dest[x] = uint16_t(cfg_.sprite_pen_or | (pix & cfg_.sprite_pen_mask));
+            }
+        }
+    }
+}
+
+// ---- Hang-On (segahang.cpp) ----
+
+// tilemap_16a_draw_layer (TILEMAP_HANGON: 4 pages, no screen flip)
+void Video::draw_16a_layer(int min_y, int max_y, int which, int category, uint8_t primark) {
+    auto text = [&](int word) { return be16(v_.textram, size_t(word)); };
+    const uint16_t xscroll = text(0xff8 / 2 + which) & 0x1ff;
+    const uint16_t yscroll = text(0xf24 / 2 + which) & 0x0ff;
+    uint16_t pages = text(0xe9e / 2 - which);
+    pages = uint16_t(((pages >> 4) & 0x0707) | ((pages << 4) & 0x7070));
+    pages &= 0x3333;
+    auto draw = [&](int x0, int x1, int y0, int y1, uint16_t effx, uint16_t effy) {
+        effx = uint16_t((0xc8 - effx + 0) & 0x3ff);
+        effy &= 0x1ff;
+        for (int y = y0; y <= y1; ++y) {
+            const int vy = (y + effy) & 0x1ff;
+            uint16_t *dest = &bitmap[size_t(y) * kWidth];
+            uint8_t *pri = &priority_[size_t(y) * kWidth];
+            for (int x = x0; x <= x1; ++x) {
+                const int vx = (x + effx) & 0x3ff;
+                const int page = (pages >> ((vx >= 512 ? 4 : 0) + (vy >= 256 ? 8 : 0))) & 0xf;
+                const int px = vx & 0x1ff, py = vy & 0xff;
+                const uint16_t data = be16(v_.tileram, size_t(page) * 64 * 32 + (py >> 3) * 64 + (px >> 3));
+                // tilemap_16a_tile_info
+                if (int((data >> 12) & 1) != category) continue;
+                const uint32_t code = uint32_t(((data >> 1) & 0x1000) | (data & 0xfff)) % tiles_;
+                const uint8_t pen = tile_pens_[size_t(code) * 64 + (py & 7) * 8 + (px & 7)];
+                if (!pen) continue;
+                dest[x] = uint16_t(pen + ((data >> 5) & 0x7f) * 8 + cfg_.tile_colorbase);
+                pri[x] |= primark;
+            }
+        }
+    };
+    const bool col = *v_.colscroll, row = *v_.rowscroll;
+    if (col && row) {
+        for (int y = min_y & ~7; y <= max_y; y += 8) {
+            const int y0 = std::max(y, min_y), y1 = std::min(y + 7, max_y);
+            for (int x = 0; x <= kWidth - 1; x += 16) {
+                const uint16_t effx = text(0xf80 / 2 + (y / 8) * 2 + which) & 0x1ff;
+                const uint16_t effy = text(0xf30 / 2 + (x / 16) * 2 + which) & 0x0ff;
+                draw(x, std::min(x + 15, kWidth - 1), y0, y1, effx, effy);
+            }
+        }
+    } else if (col) {
+        for (int x = 0; x <= kWidth - 1; x += 16) {
+            const uint16_t effy = text(0xf30 / 2 + (x / 16) * 2 + which) & 0x0ff;
+            draw(x, std::min(x + 15, kWidth - 1), min_y, max_y, xscroll, effy);
+        }
+    } else if (row) {
+        for (int y = min_y & ~7; y <= max_y; y += 8) {
+            const int y0 = std::max(y, min_y), y1 = std::min(y + 7, max_y);
+            const uint16_t effx = text(0xf80 / 2 + (y / 8) * 2 + which) & 0x1ff;
+            draw(0, kWidth - 1, y0, y1, effx, yscroll);
+        }
+    } else
+        draw(0, kWidth - 1, min_y, max_y, xscroll, yscroll);
+}
+
+// the text layer with tilemap_16a_text_info
+void Video::draw_16a_text(int min_y, int max_y, int category, uint8_t primark) {
+    for (int y = min_y; y <= max_y; ++y) {
+        uint16_t *dest = &bitmap[size_t(y) * kWidth];
+        uint8_t *pri = &priority_[size_t(y) * kWidth];
+        for (int x = 0; x < kWidth; ++x) {
+            const int px = (x + 192) & 0x1ff;
+            const uint16_t data = be16(v_.textram, size_t(y >> 3) * 64 + (px >> 3));
+            if (int((data >> 11) & 1) != category) continue;
+            const uint32_t code = uint32_t(data & 0xff) % tiles_;
+            const uint8_t pen = tile_pens_[size_t(code) * 64 + (y & 7) * 8 + (px & 7)];
+            if (!pen) continue;
+            dest[x] = uint16_t(pen + ((data >> 8) & 7) * 8 + cfg_.tile_colorbase);
+            pri[x] |= primark;
+        }
+    }
+}
+
+// segaic16_road_hangon_draw (ROAD_HANGON), from road RAM
+void Video::draw_hangon_road(int min_y, int max_y, bool foreground) {
+    auto road = [&](int w) { return be16(v_.road_buffer, size_t(w)); };
+    const int colorbase1 = cfg_.road_colorbase[0], colorbase2 = cfg_.road_colorbase[1];
+    for (int y = min_y; y <= max_y; ++y) {
+        uint16_t *dest = &bitmap[size_t(y) * kWidth];
+        const uint16_t control = road(0x000 + y);
+        const int hpos = road(0x100 + (control & 0xff));
+        const uint16_t color0 = road(0x200 + (control & 0xff));
+        const uint16_t color1 = road(0x300 + (control & 0xff));
+        const int plycont = (control >> 10) & 3;
+        if ((plycont == 0) == foreground) continue;
+        const uint8_t *src = hangon_road_gfx_.data() + (control & 0xff) * 512;
+        int ctr9m = hpos & 7;
+        int ctr9n9p = (hpos >> 3) & 0xff;
+        int ff9j1 = (hpos >> 11) & 1;
+        int ff9j2 = 1;
+        int ss8j = 0;
+        for (int x = -24; x <= kWidth - 1; ++x) {
+            const bool ctr9n9p_ena = ctr9m == 7;
+            if ((ctr9n9p & 0xff) == 0xff) ff9j1 = 0;
+            if (!(control & 0x100)) ff9j1 = 1;
+            if (!cfg_.sharrier && !(control & 0x200)) ff9j2 = 1;
+            int md = 3;
+            // ROAD_SHARRIER: control bit 9 drives the road ROM's /CE
+            if ((!cfg_.sharrier || !(control & 0x200)) && (ctr9n9p & 0xc0) == 0xc0) {
+                if (ss8j & 1) md = src[((ctr9n9p & 0x3f) << 3) | ctr9m];
+                else md = src[((ctr9n9p & 0x3f) << 3) | (ctr9m ^ 7)];
+            }
+            const int select = (ss8j >> 3) & 1;
+            int color;
+            if (ff9j2 && md == 3) {
+                color = (color0 >> (select ? 0 : 8)) & 0x3f;
+                color |= colorbase2;
+            } else {
+                if ((color1 & 0x80) && md == 3) md = 0;
+                color = (color1 >> ((md << 1) | select)) & 1;
+                color |= select << 3;
+                color |= md << 1;
+                color |= colorbase1;
+            }
+            if (x >= 0) dest[x] = uint16_t(color);
+            ctr9m = (ctr9m + 1) & 7;
+            if (ctr9n9p_ena) {
+                if (ff9j1) ++ctr9n9p;
+                else --ctr9n9p;
+            }
+            ff9j2 = !(!ff9j1 && (ss8j & 0x80));
+            ss8j = (ss8j << 1) | ff9j1;
+        }
+    }
+}
+
+// sega_hangon_sprite_device::draw (origin 189, -1: sprite row y is screen
+// row y + 1), straight from sprite RAM (word 7 is its scratch)
+void Video::draw_hangon_sprites(int min_y, int max_y) {
+    for (int y = min_y; y <= max_y; ++y) std::fill_n(&sprite_bitmap_[size_t(y) * kWidth], kWidth, uint16_t(0xffff));
+    const int ox = cfg_.sprite_origin, oy = -1;
+    const int cmin_x = ox, cmax_x = ox + kWidth - 1, cmin_y = min_y + oy, cmax_y = max_y + oy;
+    uint8_t *ram = v_.sprite_buffer;
+    const int numbanks = hangon_sprite_banks_;
+    for (size_t s = 0; s < v_.sprite_bytes / 16; ++s) {
+        const size_t w0 = s * 8;
+        auto data = [&](int i) { return be16(ram, w0 + size_t(i)); };
+        const int bottom = data(0) >> 8;
+        if (bottom > 0xf0) break;
+        const int top = data(0) & 0xff;
+        int bank = (data(1) >> 12) & 0xf;
+        const int xpos = data(1) & 0x1ff;
+        const int pitch = int16_t(data(2));
+        uint16_t addr = data(3);
+        const int colpri = (((data(4) >> 8) & 0x3f) << 4) | (((data(4) >> 0) & 0x3) << 10);
+        const int vzoom = (data(4) >> 2) & 0x3f;
+        const int hzoom = vzoom << 1;
+        set_be16(ram, w0 + 7, addr);
+        if (top >= bottom) continue;
+        if (numbanks) bank %= numbanks;
+        const uint16_t *spritedata = sprite_rom16_.data() + 0x8000 * size_t(bank);
+        int zaddr = (vzoom & 0x38) << 5;
+        const int zmask = 1 << (vzoom & 7);
+        for (int y = top; y < bottom; ++y) {
+            addr = uint16_t(addr + pitch);
+            if (zoom_[size_t(zaddr++) & 0x1fff] & zmask) addr = uint16_t(addr + pitch);
+            if (y < cmin_y || y > cmax_y) continue;
+            uint16_t *dest = &sprite_bitmap_[size_t(y - oy) * kWidth] - ox;
+            int xacc = 0;
+            int x = xpos;
+            auto plot = [&](int pix) {
+                xacc = (xacc & 0xff) + hzoom;
+                if (xacc < 0x100) {
+                    if (x >= cmin_x && x <= cmax_x && pix != 0 && pix != 15) dest[x] = uint16_t(colpri | pix);
+                    ++x;
+                }
+            };
+            if (!(addr & 0x8000)) {
+                uint16_t scratch = uint16_t(addr - 1);
+                for (; x <= cmax_x;) {
+                    const uint16_t pixels = spritedata[++scratch & 0x7fff];
+                    int pix = 0;
+                    for (int sh = 12; sh >= 0; sh -= 4) plot(pix = (pixels >> sh) & 0xf);
+                    if (pix == 15) break;
+                }
+                set_be16(ram, w0 + 7, scratch);
+            } else {
+                uint16_t scratch = uint16_t(addr + 1);
+                for (; x <= cmax_x;) {
+                    const uint16_t pixels = spritedata[--scratch & 0x7fff];
+                    int pix = 0;
+                    for (int sh = 0; sh <= 12; sh += 4) plot(pix = (pixels >> sh) & 0xf);
+                    if (pix == 15) break;
+                }
+                set_be16(ram, w0 + 7, scratch);
+            }
+        }
+    }
+}
+
+// sega_sharrier_sprite_device::draw (origin 189, -1), straight from sprite
+// RAM (word 7 is its scratch)
+void Video::draw_sharrier_sprites(int min_y, int max_y) {
+    for (int y = min_y; y <= max_y; ++y) std::fill_n(&sprite_bitmap_[size_t(y) * kWidth], kWidth, uint16_t(0xffff));
+    const int ox = cfg_.sprite_origin, oy = -1;
+    const int cmin_x = ox, cmax_x = ox + kWidth - 1, cmin_y = min_y + oy, cmax_y = max_y + oy;
+    uint8_t *ram = v_.sprite_buffer;
+    const int numbanks = hangon_sprite_banks_;
+    for (size_t s = 0; s < v_.sprite_bytes / 16; ++s) {
+        const size_t w0 = s * 8;
+        auto data = [&](int i) { return be16(ram, w0 + size_t(i)); };
+        const int bottom = data(0) >> 8;
+        if (bottom > 0xf0) break;
+        const int top = data(0) & 0xff;
+        int bank = (data(1) >> 12) & 0x7;
+        const int xpos = data(1) & 0x1ff;
+        const int colpri = ((data(2) >> 8) & 0xff) << 4;
+        const int pitch = int(int8_t(uint8_t(data(2) << 1))) >> 1; // util::sext(data[2], 7)
+        uint16_t addr = data(3);
+        const int hzoom = ((data(4) >> 8) & 0x3f) << 1;
+        const int vzoom = data(4) & 0x3f;
+        set_be16(ram, w0 + 7, addr);
+        if (top >= bottom) continue;
+        if (numbanks) bank %= numbanks;
+        const uint32_t *spritedata = sprite_rom_.data() + 0x8000 * size_t(bank);
+        int zaddr = (vzoom & 0x38) << 5;
+        const int zmask = 1 << (vzoom & 7);
+        for (int y = top; y < bottom; ++y) {
+            addr = uint16_t(addr + pitch);
+            if (zoom_[size_t(zaddr++) & 0x1fff] & zmask) addr = uint16_t(addr + pitch);
+            if (y < cmin_y || y > cmax_y) continue;
+            uint16_t *dest = &sprite_bitmap_[size_t(y - oy) * kWidth] - ox;
+            int xacc = 0;
+            int x = xpos;
+            auto plot = [&](int pix) {
+                xacc = (xacc & 0xff) + hzoom;
+                if (xacc < 0x100) {
+                    if (x >= cmin_x && x <= cmax_x && pix != 0 && pix != 15) dest[x] = uint16_t(colpri | pix);
+                    ++x;
+                }
+            };
+            if (!(addr & 0x8000)) {
+                uint16_t scratch = uint16_t(addr - 1);
+                for (; x <= cmax_x;) {
+                    const uint32_t pixels = spritedata[++scratch & 0x7fff];
+                    int pix = 0;
+                    for (int sh = 28; sh >= 0; sh -= 4) plot(pix = int((pixels >> sh) & 0xf));
+                    if (pix == 15) break;
+                }
+                set_be16(ram, w0 + 7, scratch);
+            } else {
+                uint16_t scratch = uint16_t(addr + 1);
+                for (; x <= cmax_x;) {
+                    const uint32_t pixels = spritedata[--scratch & 0x7fff];
+                    int pix = 0;
+                    for (int sh = 0; sh <= 28; sh += 4) plot(pix = int((pixels >> sh) & 0xf));
+                    if (pix == 15) break;
+                }
+                set_be16(ram, w0 + 7, scratch);
+            }
+        }
+    }
+}
+
+// segahang_state::screen_update (Hang On mixing)
+void Video::update_hangon(int min_y, int max_y) {
+    if (!*v_.display_enable) {
+        for (int y = min_y; y <= max_y; ++y) std::fill_n(&bitmap[size_t(y) * kWidth], kWidth, black_pen());
+        return;
+    }
+    if (cfg_.sharrier) draw_sharrier_sprites(min_y, max_y);
+    else draw_hangon_sprites(min_y, max_y);
+    for (int y = min_y; y <= max_y; ++y) std::fill_n(&priority_[size_t(y) * kWidth], kWidth, uint8_t(0));
+    draw_hangon_road(min_y, max_y, false);
+    draw_16a_layer(min_y, max_y, 1, 0, 0x01); // background
+    draw_16a_layer(min_y, max_y, 1, 1, 0x02);
+    draw_16a_layer(min_y, max_y, 0, 0, 0x02); // foreground
+    draw_16a_layer(min_y, max_y, 0, 1, 0x04);
+    draw_hangon_road(min_y, max_y, true);
+    draw_16a_text(min_y, max_y, 0, 0x08);
+    draw_16a_text(min_y, max_y, 1, 0x08);
+    const uint16_t n = cfg_.palette_entries;
+    for (int y = min_y; y <= max_y; ++y) {
+        uint16_t *dest = &bitmap[size_t(y) * kWidth];
+        const uint16_t *src = &sprite_bitmap_[size_t(y) * kWidth];
+        const uint8_t *pri = &priority_[size_t(y) * kWidth];
+        for (int x = 0; x < kWidth; ++x) {
+            const uint16_t pix = src[x];
+            if (pix == 0xffff) continue;
+            if (cfg_.sharrier) {
+                // Space Harrier mixing
+                const int priority = ((pix >> 9) & 2) | 1;
+                if ((1 << priority) > pri[x]) {
+                    if ((pix & 0x80f) == 0x00a) dest[x] = uint16_t(dest[x] + n);
+                    else dest[x] = uint16_t(0x400 | (pix & 0x3ff));
+                }
+                continue;
+            }
+            const int priority = pix >> 10;
+            if ((1 << priority) > pri[x]) {
+                if ((pix & 0x3f0) == 0x3f0) dest[x] = uint16_t(dest[x] + (*v_.shadow ? n * 2 : n));
+                else dest[x] = uint16_t(0x400 | (pix & 0x3ff));
             }
         }
     }

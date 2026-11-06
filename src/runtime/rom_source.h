@@ -3,7 +3,7 @@
 // CRC, and checked against the size and CRC in MAME's ROM_START.
 #pragma once
 
-#include "runtime/zip.h"
+#include "afcommon/zip.h"
 
 #include <cstdint>
 #include <memory>
@@ -34,7 +34,7 @@ public:
 
 private:
     std::string dir_;
-    std::unique_ptr<Zip> zip_;
+    std::unique_ptr<afc::Zip> zip_;
 };
 
 } // namespace rt

@@ -12,8 +12,13 @@ frame by frame (attract, test mode and a full game to game over).
 
 | Board | Games (MAME sets) | Status |
 | --- | --- | --- |
-| Sega Out Run board | outrun, outrunra, outruno, outrundx | In progress |
-| Sega System Multi 32 | orunners, orunnersu, orunnersj | Planned |
+| Sega Hang-On board | hangon, sharrier, enduror | Matches MAME |
+| Sega Out Run board | outrun (and outrunra, outruno, outrundx), shangon, toutrun | Matches MAME |
+| Sega X Board | aburner2, aburner131, thndrbld, thndrbld1, rachero, smgp, loffire, gprider | Matches MAME |
+| Sega Y Board | gforce2, pdrift, gloc, strkfgtr, rchase | Matches MAME |
+| Sega System Multi 32 / System 32 | orunners, radr, radm, f1en, jpark, sonic, ga2 | Matches MAME |
+
+How the cores are designed: [docs/design](docs/design/README.md).
 
 ## Building a core
 
@@ -25,7 +30,7 @@ ymfm). From your MAME set:
 This checks every file's CRC, translates the two 68000 programs into C++
 (`build/outrun/gen/`, derived from your ROMs: never commit it) and builds
 `build/outrun/libafcore_outrun.so` (`afcore_outrun.framework` on macOS),
-which exports one symbol, `afcore_api_outrun` (`include/afcore.h`).
+which exports one symbol, `afcore_api_outrun` (`common/include/afcore.h`).
 `build/outrun/afcore_run ROMSET FRAMES` runs it headless.
 
 Cross builds (iOS, tvOS, arm64 Linux) run `recompile.py --gen-only` on the

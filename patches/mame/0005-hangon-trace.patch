@@ -1,0 +1,179 @@
+# Hang-On trace for segahang.cpp, on top of 0001-0004: the PLD dumps load
+# optionally; each screen update logs "f FRAME MAIN SUB Z80CYC IDXHASH RGBHASH
+# MINY MAXY" (ORTRACE_HASH_CLIP hashes only the rows drawn), ORTRACE_FBDUMP_DIR
+# writes the frames, ORTRACE_REPLAY replays tests/replays/hangon_*.rpl
+# (SERVICE, COINAGE, DSW, UNKNOWN, ADC0-3) and ORTRACE_PCS writes the seeds
+# at exit. Build: make SUBTARGET=hang SOURCES=src/mame/sega/segahang.cpp
+# (MAME's first screen update comes at power on, so its frame N+1 is the
+# native frame N.)
+
+diff --git a/src/mame/sega/segahang.cpp b/src/mame/sega/segahang.cpp
+index 747a7ba3d5..5ac31ad64f 100644
+--- a/src/mame/sega/segahang.cpp
++++ b/src/mame/sega/segahang.cpp
+@@ -40,6 +40,8 @@
+ #include "sound.h"
+ #include "speaker.h"
+ 
++#include <vector>
++
+ #define LOG_MCU (1U << 1)
+ //#define VERBOSE (LOG_MCU)
+ #include "logmacro.h"
+@@ -131,6 +133,7 @@ private:
+ 
+ 	// video updates
+ 	uint32_t screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
++	uint32_t screen_update_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+ 
+ 	void decrypted_opcodes_map(address_map &map) ATTR_COLD;
+ 	void fd1094_decrypted_opcodes_map(address_map &map) ATTR_COLD;
+@@ -194,7 +197,94 @@ void segahang_state::video_start()
+ //  screen_update - render all graphics
+ //-------------------------------------------------
+ 
++// Hang-On board oracle (ORTRACE_LOG): one line per screen update with both
++// 68000s' instruction counts and hashes of the indexed and RGB screen;
++// ORTRACE_REPLAY: "UPDATE PORT VALUE" lines (PORT: service, coinage, dsw,
++// unknown, adc0-adc3; VALUE hex), applied after the native core's screen
++// update UPDATE (MAME's UPDATE+1). ORTRACE_FBDUMP_DIR/_EVERY dump RGB frames.
++static int g_hang_in[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
++struct hang_replay_ev { u64 update; int port; int value; };
++static std::vector<hang_replay_ev> g_hang_replay;
++static size_t g_hang_replay_pos = 0;
++static void hangtrace_replay_load()
++{
++	const char *path = getenv("ORTRACE_REPLAY");
++	if (!path) return;
++	FILE *f = fopen(path, "r");
++	if (!f) return;
++	static const char *const names[8] = { "service", "coinage", "dsw", "unknown", "adc0", "adc1", "adc2", "adc3" };
++	char line[256];
++	while (fgets(line, sizeof line, f))
++	{
++		unsigned long long u; char name[32]; unsigned v;
++		if (line[0] == '#' || sscanf(line, "%llu %31s %x", &u, name, &v) != 3) continue;
++		for (int i = 0; i < 8; i++)
++			if (!strcmp(name, names[i])) g_hang_replay.push_back({ u, i, int(v & 0xff) });
++	}
++	fclose(f);
++}
++
++static void hangtrace_frame(m68000_device &main, m68000_device &sub, z80_device &snd, palette_device &palette, bitmap_ind16 &bitmap, const rectangle &clip)
++{
++	static const bool hash_clip = getenv("ORTRACE_HASH_CLIP") != nullptr;
++	static u64 frame = 0;
++	static bool init = false;
++	static const char *dir = nullptr;
++	static u64 every = 1;
++	if (!init)
++	{
++		init = true;
++		dir = getenv("ORTRACE_FBDUMP_DIR");
++		if (const char *e = getenv("ORTRACE_FBDUMP_EVERY")) every = strtoull(e, nullptr, 10);
++		if (!every) every = 1;
++		hangtrace_replay_load();
++	}
++	if (g_ortrace_log || dir)
++	{
++		u64 hi = 1469598103934665603ULL, hr = 1469598103934665603ULL;
++		std::vector<u8> rgb;
++		if (dir && !(frame % every)) rgb.reserve(320 * 224 * 3);
++		for (int y = 0; y < 224; y++)
++		{
++			const bool hash_row = !hash_clip || (y >= clip.min_y && y <= clip.max_y);
++			u16 const *row = &bitmap.pix(y);
++			for (int x = 0; x < 320; x++)
++			{
++				rgb_t const c = palette.pen_color(row[x]);
++				if (hash_row)
++				{
++					hi = (hi ^ row[x]) * 1099511628211ULL;
++					hr = (hr ^ (c & 0xffffff)) * 1099511628211ULL;
++				}
++				if (dir && !(frame % every)) { rgb.push_back(c.r()); rgb.push_back(c.g()); rgb.push_back(c.b()); }
++			}
++		}
++		if (g_ortrace_log)
++			fprintf(g_ortrace_log, "f %llu %llu %llu %llu %016llx %016llx %d %d\n", (unsigned long long)frame, (unsigned long long)main.or_insn(),
++					(unsigned long long)sub.or_insn(), (unsigned long long)snd.total_cycles(), (unsigned long long)hi, (unsigned long long)hr, clip.min_y, clip.max_y);
++		if (dir && !(frame % every))
++		{
++			char path[1024];
++			snprintf(path, sizeof path, "%s/f%06llu.rgb", dir, (unsigned long long)frame);
++			if (FILE *f = fopen(path, "wb")) { fwrite(rgb.data(), 1, rgb.size(), f); fclose(f); }
++		}
++	}
++	while (g_hang_replay_pos < g_hang_replay.size() && g_hang_replay[g_hang_replay_pos].update + 1 <= frame)
++	{
++		g_hang_in[g_hang_replay[g_hang_replay_pos].port] = g_hang_replay[g_hang_replay_pos].value;
++		g_hang_replay_pos++;
++	}
++	frame++;
++}
++
+ uint32_t segahang_state::screen_update(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
++{
++	uint32_t const r = screen_update_draw(screen, bitmap, cliprect);
++	hangtrace_frame(*m_maincpu, *m_subcpu, *m_soundcpu, *m_palette, bitmap, cliprect);
++	return r;
++}
++
++uint32_t segahang_state::screen_update_draw(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect)
+ {
+ 	// if no drawing is happening, fill with black and get out
+ 	if (!m_segaic16vid->m_display_enable)
+@@ -431,6 +521,7 @@ uint8_t segahang_state::adc_status_r()
+ uint8_t segahang_state::hangon_inputs_r(offs_t offset)
+ {
+ 	static const char *const sysports[] = { "SERVICE", "COINAGE", "DSW", "UNKNOWN" };
++	if (g_hang_in[offset & 3] >= 0) return g_hang_in[offset & 3];
+ 	return ioport(sysports[offset & 3])->read();
+ }
+ 
+@@ -443,6 +534,8 @@ uint8_t segahang_state::hangon_inputs_r(offs_t offset)
+ uint8_t segahang_state::sharrier_inputs_r(offs_t offset)
+ {
+ 	static const char *const sysports[] = { "SERVICE", "UNKNOWN", "COINAGE", "DSW" };
++	static const int replay_port[4] = { 0, 3, 1, 2 };
++	if (g_hang_in[replay_port[offset & 3]] >= 0) return g_hang_in[replay_port[offset & 3]];
+ 	return ioport(sysports[offset & 3])->read();
+ }
+ 
+@@ -465,6 +558,7 @@ void segahang_state::sync_ppi_w(offs_t offset, uint8_t data)
+ 
+ uint8_t segahang_state::analog_r()
+ {
++	if (g_hang_in[4 + m_adc_select] >= 0) return g_hang_in[4 + m_adc_select];
+ 	return m_adc_ports[m_adc_select].read_safe(0);
+ }
+ 
+@@ -562,6 +656,7 @@ void segahang_state::i8751_p1_w(uint8_t data)
+ void segahang_state::machine_start()
+ {
+ 	m_i8751_sync_timer = timer_alloc(FUNC(segahang_state::i8751_sync), this);
++	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([] () { ortrace_write_pcs(); }));
+ }
+ 
+ 
+@@ -1305,15 +1400,15 @@ ROM_START( hangon )
+ 	ROM_LOAD( "epr-6844.ic123", 0x0000, 0x2000, CRC(e3ec7bd6) SHA1(feec0fe664e16fac0fde61cf64b401b9b0575323) )
+ 
+ 	ROM_REGION( 0x300, "plds", 0 )
+-	ROM_LOAD( "315-5118.bin", 0x000, 0x08f, CRC(51d448a2) SHA1(0a1018cc1d4c6dc87625d59539d257e01c9dc872) )
+-	ROM_LOAD( "315-5119.bin", 0x100, 0x08f, CRC(a37f00e1) SHA1(129b10f6cb48e1a1fefd69009380516cf2c677b5) )
+-	ROM_LOAD( "315-5120.bin", 0x200, 0x08f, CRC(ba5f92ec) SHA1(74e1fb137ac2ab6dbdad2e8111c27b836e2ff14b) )
++	ROM_LOAD_OPTIONAL( "315-5118.bin", 0x000, 0x08f, CRC(51d448a2) SHA1(0a1018cc1d4c6dc87625d59539d257e01c9dc872) )
++	ROM_LOAD_OPTIONAL( "315-5119.bin", 0x100, 0x08f, CRC(a37f00e1) SHA1(129b10f6cb48e1a1fefd69009380516cf2c677b5) )
++	ROM_LOAD_OPTIONAL( "315-5120.bin", 0x200, 0x08f, CRC(ba5f92ec) SHA1(74e1fb137ac2ab6dbdad2e8111c27b836e2ff14b) )
+ 
+ 	ROM_REGION( 0xeb, "soundboard_plds", 0 )
+-	ROM_LOAD( "315-5103.6e", 0x00, 0xeb, CRC(85284c32) SHA1(45bcc6745b3540777eed02374064d2f853b4fe1f) ) // PLS153
++	ROM_LOAD_OPTIONAL( "315-5103.6e", 0x00, 0xeb, CRC(85284c32) SHA1(45bcc6745b3540777eed02374064d2f853b4fe1f) ) // PLS153
+ 
+ 	ROM_REGION( 0xeb, "romboard_plds", 0 )
+-	ROM_LOAD( "315-5121.2a", 0x00, 0xeb, CRC(5dd89643) SHA1(b94bbed9fca269d198788e0a5e995ce7cbc453d7) ) // PLS153
++	ROM_LOAD_OPTIONAL( "315-5121.2a", 0x00, 0xeb, CRC(5dd89643) SHA1(b94bbed9fca269d198788e0a5e995ce7cbc453d7) ) // PLS153
+ ROM_END
+ 
+ //*************************************************************************************************************************

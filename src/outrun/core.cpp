@@ -1,4 +1,4 @@
-// The Out Run board's cores as afcore libraries (include/afcore.h): one
+// The Out Run board's cores as afcore libraries (common/include/afcore.h): one
 // game per library (Out Run; Super Hang-On with C2D_SHANGON; Turbo Out Run
 // with C2D_TOUTRUN), driven a frame at a time by the front end.
 #include "afcore.h"
@@ -51,6 +51,19 @@ std::string nv_path(const afcore *c) { return c->save_dir + "/" + kSet + ".nv"; 
 
 void copy_error(char *err, size_t n, const std::string &s) {
     if (err && n) std::snprintf(err, n, "%s", s.c_str());
+}
+
+// afcore 5.2: the loader create uses reads every file and checks its size
+// and CRC; nothing is kept.
+int check_roms(const char *rom_path, char *report, size_t report_size) {
+    try {
+        orun::import_rom_set(rom_path ? rom_path : "", kGame);
+        copy_error(report, report_size, "");
+        return 1;
+    } catch (const std::exception &e) {
+        copy_error(report, report_size, e.what());
+        return 0;
+    }
 }
 
 afcore *create(const char *rom_path, const char *save_dir, char *err, size_t err_size) {
@@ -111,7 +124,9 @@ void apply_input(afcore *c, const afcore_input *in) {
         if (buttons & AFCORE_TEST) u &= ~0x04;
         if (buttons & AFCORE_SERVICE) u &= ~0x08;
         if (buttons & AFCORE_START) u &= ~0x10;
-        if (buttons & (AFCORE_TRIGGER1 | AFCORE_SHIFT_UP)) u &= ~0x20;
+        // (not TRIGGER1: the front ends set it when the throttle trigger is
+        // pressed past half way, which would make the turbo automatic)
+        if (buttons & (AFCORE_SHIFT_UP | AFCORE_VIEW1)) u &= ~0x20;
         p.unknown = u;
         // handlebar 0xe0 (left) .. 0x20 (right): PORT_REVERSE; throttle and brake 0 .. 0xff
         p.adc[0] = analog((1.0f - std::clamp(steer, -1.0f, 1.0f)) * 0.5f, 0x20, 0xe0);
@@ -134,8 +149,10 @@ void apply_input(afcore *c, const afcore_input *in) {
     if (buttons & AFCORE_START) s &= ~0x08;
     if (buttons & AFCORE_COIN) s &= ~0x40;
     if (c->high_gear) s |= 0x10;
-    // Turbo Out Run: D5 turbo (active low)
-    if (kGame == orun::Game::toutrun && (buttons & AFCORE_TRIGGER1)) s &= ~0x20;
+    // Turbo Out Run: D5 turbo (active low), on VIEW1 (A / South; the
+    // shift buttons are the gear lever, and the front ends set TRIGGER1
+    // with the throttle trigger)
+    if (kGame == orun::Game::toutrun && (buttons & AFCORE_VIEW1)) s &= ~0x20;
     p.service = s;
     // steering 0x20 (left) .. 0xe0 (right), pedals 0 .. 0xff
     p.adc[0] = analog((std::clamp(steer, -1.0f, 1.0f) + 1.0f) * 0.5f, 0x20, 0xe0);
@@ -220,6 +237,7 @@ afcore_api make_api() {
     a.width = orun::Video::kWidth;
     a.height = orun::Video::kHeight;
     a.create = create;
+    a.check_roms = check_roms;
     a.destroy = destroy;
     a.run_frame = run_frame;
     a.screen = screen;

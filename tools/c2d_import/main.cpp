@@ -1,15 +1,18 @@
 // Checks the user's ROM set against MAME's ROM_START and writes the two
-// 68000 program images the recompiler reads:
+// 68000 program images the recompiler reads (the Y Board's three: <SET>_main,
+// _subx and _suby):
 //   c2d_import SET ROMSET OUTDIR [STATES]  ->  OUTDIR/<SET>_main.bin, <SET>_sub.bin
 // For an FD1094 set (toutrun) it also writes <SET>_main_op.bin, the opcodes
 // decrypted in the states listed in STATES (seeds/<set>.main: "PC STATE").
-// For orunners and radr (a V70, a V60) it writes OUTDIR/SET_main.bin, the CPU's 24-bit
+// For orunners, radr and radm (a V70, a V60) it writes OUTDIR/SET_main.bin, the CPU's 24-bit
 // space as v60recomp reads it: the ROM at 0, its first MiB again at f00000.
-// SET is a MAME set name (outrun, shangon, toutrun, aburner2, thndrbld, thndrbld1, orunners, radr); ROMSET a .zip or a
+// SET is a MAME set name (outrun, shangon, toutrun, aburner2, aburner131, thndrbld, thndrbld1, rachero, smgp, loffire, gprider, orunners, radr, radm, hangon, sharrier, enduror, gforce2, pdrift, gloc, strkfgtr, rchase); ROMSET a .zip or a
 // folder of its files.
 #include "outrun/rom_import.h"
 #include "xboard/rom_import.h"
 #include "system32/rom_import.h"
+#include "hangon/rom_import.h"
+#include "yboard/rom_import.h"
 #include "fd1094/opcode_image.h"
 
 #include <algorithm>
@@ -26,7 +29,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     try {
-        std::vector<uint8_t> main_img, sub_img, op_img;
+        std::vector<uint8_t> main_img, sub_img, op_img, subx_img, suby_img;
         const std::string set = argv[1];
         if (set == orun::kRomSet || set == orun::kShangonRomSet || set == orun::kToutrunRomSet) {
             const orun::Game g = set == orun::kRomSet ? orun::Game::outrun : set == orun::kShangonRomSet ? orun::Game::shangon : orun::Game::toutrun;
@@ -42,8 +45,8 @@ int main(int argc, char **argv) {
             }
             main_img = std::move(r.main);
             sub_img = std::move(r.sub);
-        } else if (set == xbd::kRomSet || set == xbd::kThndrbldRomSet || set == xbd::kThndrbld1RomSet) {
-            const xbd::Game g = set == xbd::kRomSet ? xbd::Game::aburner2 : set == xbd::kThndrbldRomSet ? xbd::Game::thndrbld : xbd::Game::thndrbld1;
+        } else if (set == xbd::kRomSet || set == xbd::kAburner131RomSet || set == xbd::kThndrbldRomSet || set == xbd::kThndrbld1RomSet || set == xbd::kRacheroRomSet || set == xbd::kSmgpRomSet || set == xbd::kLoffireRomSet || set == xbd::kGpriderRomSet) {
+            const xbd::Game g = set == xbd::kRomSet ? xbd::Game::aburner2 : set == xbd::kAburner131RomSet ? xbd::Game::aburner131 : set == xbd::kThndrbldRomSet ? xbd::Game::thndrbld : set == xbd::kRacheroRomSet ? xbd::Game::rachero : set == xbd::kSmgpRomSet ? xbd::Game::smgp : set == xbd::kLoffireRomSet ? xbd::Game::loffire : set == xbd::kGpriderRomSet ? xbd::Game::gprider : xbd::Game::thndrbld1;
             xbd::Roms r = xbd::import_rom_set(argv[2], g);
             if (!r.fd1094_key.empty()) {
                 const auto pcs = argc == 5 ? fd1094::read_state_seeds(argv[4]) : decltype(fd1094::read_state_seeds("")){};
@@ -56,7 +59,24 @@ int main(int argc, char **argv) {
             }
             main_img = std::move(r.main);
             sub_img = std::move(r.sub);
-        } else if (set == s32::kOrunnersRomSet || set == s32::kRadrRomSet) {
+        } else if (set == ybd::kGforce2RomSet || set == ybd::kPdriftRomSet || set == ybd::kGlocRomSet ||
+                   set == ybd::kStrkfgtrRomSet || set == ybd::kRchaseRomSet) {
+            ybd::Roms r = ybd::import_rom_set(argv[2], set == ybd::kPdriftRomSet ? ybd::Game::pdrift
+                                                       : set == ybd::kGlocRomSet  ? ybd::Game::gloc
+                                                       : set == ybd::kStrkfgtrRomSet ? ybd::Game::strkfgtr
+                                                       : set == ybd::kRchaseRomSet   ? ybd::Game::rchase
+                                                                                  : ybd::Game::gforce2);
+            main_img = std::move(r.main);
+            subx_img = std::move(r.subx);
+            suby_img = std::move(r.suby);
+        } else if (set == hang::kRomSet || set == hang::kSharrierRomSet || set == hang::kEndurorRomSet) {
+            hang::Roms r = hang::import_rom_set(argv[2], set == hang::kRomSet           ? hang::Game::hangon
+                                                         : set == hang::kSharrierRomSet ? hang::Game::sharrier
+                                                                                        : hang::Game::enduror);
+            op_img = std::move(r.main_op); // enduror: the FD1089B's decrypted opcodes
+            main_img = std::move(r.main);
+            sub_img = std::move(r.sub);
+        } else if (set == s32::kOrunnersRomSet || set == s32::kRadrRomSet || set == s32::kRadmRomSet || set == s32::kF1enRomSet || set == s32::kJparkRomSet || set == s32::kSonicRomSet || set == s32::kGa2RomSet) {
             s32::Roms r = s32::import_rom_set(argv[2], set);
             main_img.assign(0x1000000, 0xff);
             std::copy(r.main.begin(), r.main.end(), main_img.begin());
@@ -66,7 +86,8 @@ int main(int argc, char **argv) {
             return 2;
         }
         const std::string out = argv[3];
-        for (const auto &[name, img] : {std::pair{"main", &main_img}, std::pair{"sub", &sub_img}, std::pair{"main_op", &op_img}}) {
+        for (const auto &[name, img] : {std::pair{"main", &main_img}, std::pair{"sub", &sub_img}, std::pair{"main_op", &op_img},
+                                       std::pair{"subx", &subx_img}, std::pair{"suby", &suby_img}}) {
             if (img->empty()) continue;
             std::ofstream f(out + "/" + set + "_" + name + ".bin", std::ios::binary);
             f.write(reinterpret_cast<const char *>(img->data()), std::streamsize(img->size()));

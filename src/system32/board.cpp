@@ -83,8 +83,10 @@ void Io5296::write(int offset, uint8_t data) {
 
 uint32_t Board::ym_clock(bool multi32) { return (multi32 ? kMainClock : kS32Clock) / 4; }
 
-Board::Board(Roms roms, RunFn run)
+Board::Board(Roms roms, RunFn run, sched::Scheduler *shared)
     : roms_(std::move(roms)),
+      own_sched_(shared ? nullptr : std::make_unique<sched::Scheduler>()),
+      sched_(shared ? *shared : *own_sched_),
       ym_(sched_, ym_clock(roms_.multi32), [this](bool asserted) {
           // ym3438_irq_handler
           if (asserted) signal_sound_irq(SOUND_IRQ_YM3438);
@@ -96,6 +98,7 @@ Board::Board(Roms roms, RunFn run)
     roms_.sound.resize(m32 ? 0x80000 : 0x400000, 0xff);
     if (m32) roms_.pcm.resize(0x400000, 0);
     for (int i = 0; i < 2; ++i) screen[i].assign(size_t(Video::kWidth) * Video::kHeight, 0);
+    std::copy(roms_.analog_rest.begin(), roms_.analog_rest.end(), inputs.analog);
 
     // the screen: set_refresh_hz(60), 416x262, visible 416x224
     frame_period_ = sched::hz_to_attoseconds(60u);
@@ -112,6 +115,27 @@ Board::Board(Roms roms, RunFn run)
     sched_.add_exec(z80_.get());
     main_->irq_vector = [this] { return irq_callback(); };
     video_ = std::make_unique<Video>(roms_.tiles, roms_.sprites, m32);
+    if (!roms_.mcu.empty()) {
+        // the V25 (10 MHz): ROM at 00000 and again at f0000, the MB8421's
+        // left side at 10000-1ffff
+        roms_.mcu.resize(0x10000, 0xff);
+        mcu_ = std::make_unique<v25::V25>(sched_, "mcu", 10000000, roms_.mcu_opcodes);
+        mcu_->program_r = [this](uint32_t a) -> uint8_t {
+            if (a < 0x10000) return roms_.mcu[a];
+            if (a < 0x20000) return dpram_[a & 0x7ff];
+            if (a >= 0xf0000) return roms_.mcu[a & 0xffff];
+            return 0;
+        };
+        mcu_->program_w = [this](uint32_t a, uint8_t d) {
+            if (a >= 0x10000 && a < 0x20000) dpram_[a & 0x7ff] = d;
+        };
+        mcu_->device_start();
+    }
+    if (roms_.four_player) {
+        ppi_.in_pa = [this] { return inputs.extra[0]; };
+        ppi_.in_pb = [this] { return inputs.extra[1]; };
+        ppi_.in_pc = [this] { return inputs.extra[2]; };
+    }
     if (m32) {
         pcm_ = std::make_unique<snd::MultiPcm>(kPcmClock, roms_.pcm.data(), uint32_t(roms_.pcm.size()));
         pcm_->set_split_banks(0, 0);
@@ -131,6 +155,9 @@ Board::Board(Roms roms, RunFn run)
         v60::Bus::rd[p] = workram_.data() + (m32 ? size_t(p & 1) * 0x10000 : 0);
         v60::Bus::wr[p] = v60::Bus::rd[p];
     }
+    // SegaSonic: 20e5c4 has a write handler, so the first copy of work RAM
+    // goes through read16 / write16 (the mirrors stay plain RAM, as in MAME)
+    if (roms_.sonic_protection) v60::Bus::rd[0x20] = v60::Bus::wr[0x20] = nullptr;
     for (int p = 0xf0; p < 0x100; ++p) v60::Bus::rd[p] = roms_.main.data() + size_t(p - 0xf0) * 0x10000;
     // video RAM and sprite RAM: plain memory (their handlers only store;
     // the video reads them at render time)
@@ -240,6 +267,8 @@ void Board::reset() {
     std::memset(v60_irq_control_, 0xff, sizeof v60_irq_control_);
     main_->reset();
     for (auto &io : io_) io.reset();
+    if (roms_.four_player) ppi_.reset();
+    if (mcu_) mcu_->device_reset();
     comm_zfg_ = comm_cn_ = comm_fg_ = 0;
     adc_shift_ = 0;
     analog_bank_ = 0;
@@ -252,8 +281,9 @@ void Board::run_frame() {
 
 uint16_t Board::rand16() {
     // running_machine::rand
-    rand_seed_ = 1664525 * rand_seed_ + 1013904223;
-    return uint16_t((rand_seed_ >> 16) | (rand_seed_ << 16));
+    uint32_t &seed = *rand_seed_p_;
+    seed = 1664525 * seed + 1013904223;
+    return uint16_t((seed >> 16) | (seed << 16));
 }
 
 // ---- the V70's devices ----
@@ -348,11 +378,17 @@ uint16_t Board::read16(uint32_t a, uint16_t m) {
         return video_->mixer[roms_.multi32 ? 1 : 0][(a >> 1) & 0x3f];
     default: break;
     }
+    if (a >= 0x200000 && a < 0x210000) { // work RAM (SegaSonic's first copy)
+        const uint32_t o = a & 0xffff;
+        return uint16_t(workram_[o] | workram_[o + 1] << 8);
+    }
     if (a >= 0x700000 && a < 0x800000) {
         // shared RAM: an 8-bit handler on every lane
         const uint32_t o = a & 0x1fff;
         return uint16_t(shared_ram_[o] | shared_ram_[o + 1] << 8);
     }
+    if (dual_ && a >= 0x810000 && a < 0x811000) return dual_->comms[(a >> 1) & 0x7ff]; // dual_pcb_comms_r
+    if (dual_ && a >= 0x818000 && a < 0x818004) return dual_id_; // dual_pcb_mainsub / dual_pcb_sub
     if (a >= 0x800000 && a < 0x801000) // comm shared RAM (umask 0x00ff00ff)
         return uint16_t(0xff00 | comm_shared_[off8 & 0x7ff]);
     if (a == 0x801000) return uint16_t(0xff00 | comm_cn_ | 0xfe); // cn_r
@@ -360,6 +396,13 @@ uint16_t Board::read16(uint32_t a, uint16_t m) {
     if (a >= 0xc00000 && (a < 0xc80000 || (!roms_.multi32 && a < 0xd00000))) {
         const uint32_t o = a & 0x7f;
         if (o < 0x20) return uint16_t(0xff00 | ((m & 0xff) ? io_[0].read(int(o >> 1)) : 0xff));
+        if (roms_.four_player && o >= 0x60 && o < 0x68) // the 8255 (umask16 0x00ff)
+            return uint16_t(0xff00 | ((m & 0xff) ? ppi_.read(int((o >> 1) & 3)) : 0xff));
+        if (roms_.trackball) {
+            // upd1-3 read_xy (umask16 0x00ff)
+            if (o >= 0x40 && o < 0x58 && (m & 0xff)) return uint16_t(0xff00 | upd_[(o - 0x40) >> 3].read_xy(int((o >> 1) & 3)));
+            return 0xffff;
+        }
         if (o >= 0x50 && o < 0x58) // MSM6253 d7_r
             if (m & 0xff) {
                 const bool msb = adc_shift_ & 0x80;
@@ -384,6 +427,8 @@ uint16_t Board::read16(uint32_t a, uint16_t m) {
         return r;
     }
     if (a >= 0xd80000 && a < 0xe00000) return rand16(); // random_number_r
+    if (mcu_ && a >= 0xa00000 && a < 0xa01000) // the MB8421's right side (umask16 0x00ff)
+        return uint16_t(0xff00 | ((m & 0xff) ? dpram_[(a >> 1) & 0x7ff] : 0xff));
     return 0xffff; // unmapped (unmap_value_high)
 }
 
@@ -412,12 +457,28 @@ void Board::write16(uint32_t a, uint16_t v, uint16_t m) {
     }
     default: break;
     }
+    if (a >= 0x200000 && a < 0x210000) { // work RAM (SegaSonic's first copy)
+        if (roms_.sonic_protection && a == 0x20e5c4) {
+            sonic_level_load_protection(v, m);
+            return;
+        }
+        const uint32_t o = a & 0xffff;
+        if (m & 0x00ff) workram_[o] = uint8_t(v);
+        if (m & 0xff00) workram_[o + 1] = uint8_t(v >> 8);
+        return;
+    }
     if (a >= 0x700000 && a < 0x800000) {
         const uint32_t o = a & 0x1fff;
         if (m & 0x00ff) shared_ram_[o] = uint8_t(v);
         if (m & 0xff00) shared_ram_[o + 1] = uint8_t(v >> 8);
         return;
     }
+    if (dual_ && a >= 0x810000 && a < 0x811000) { // dual_pcb_comms_w
+        uint16_t &r = dual_->comms[(a >> 1) & 0x7ff];
+        r = uint16_t((r & ~m) | (v & m));
+        return;
+    }
+    if (dual_ && a >= 0x818000 && a < 0x818004) return;
     if (a >= 0x800000 && a < 0x801000) {
         if (m & 0xff) comm_shared_[off8 & 0x7ff] = uint8_t(v);
         return;
@@ -442,7 +503,10 @@ void Board::write16(uint32_t a, uint16_t v, uint16_t m) {
         const uint32_t o = a & 0x7f;
         if (!(m & 0xff)) return;
         if (o < 0x20) io_[0].write(int(o >> 1), uint8_t(v));
-        else if (o >= 0x50 && o < 0x58) { // MSM6253 address_w
+        else if (roms_.four_player && o >= 0x60 && o < 0x68) ppi_.write(int((o >> 1) & 3), uint8_t(v));
+        else if (roms_.trackball) {
+            if (o >= 0x40 && o < 0x58) upd_[(o - 0x40) >> 3].reset_xy_w();
+        } else if (o >= 0x50 && o < 0x58) { // MSM6253 address_w
             const int port = int((o >> 1) & 3);
             switch (port) {
             case 0: adc_shift_ = inputs.analog[0]; break;
@@ -462,6 +526,10 @@ void Board::write16(uint32_t a, uint16_t v, uint16_t m) {
         const int o = int(a & 0xf);
         if (m & 0x00ff) int_control_w(o, uint8_t(v));
         if (m & 0xff00) int_control_w(o + 1, uint8_t(v >> 8));
+        return;
+    }
+    if (mcu_ && a >= 0xa00000 && a < 0xa01000) { // the MB8421's right side
+        if (m & 0xff) dpram_[(a >> 1) & 0x7ff] = uint8_t(v);
         return;
     }
     // random_number_w, ROM, unmapped: nothing
@@ -564,6 +632,10 @@ void Board::vblank_begin() {
     vblank_end_time_ = vblank_start_time_ + attotime(0, vblank_period_);
     video_->render(0, screen[0].data());
     video_->render(1, screen[1].data());
+    // video_manager::frame_update's MACHINE_NOTIFY_FRAME: the uPD4701s
+    // count the trackballs' movement since the last frame
+    if (roms_.trackball)
+        for (int i = 0; i < 3; ++i) upd_[i].update(inputs.track[2 * i], inputs.track[2 * i + 1]);
     if (on_frame) on_frame();
     start_of_vblank_int();
     frame_done_ = true;
@@ -572,6 +644,82 @@ void Board::vblank_begin() {
 }
 
 void Board::vblank_end() { ++frame_number_; }
+
+// segas32_state::sonic_level_load_protection (segas32_m.cpp)
+void Board::sonic_level_load_protection(uint16_t data, uint16_t mem_mask) {
+    auto wr16 = [this](uint32_t o, uint16_t v) {
+        workram_[o] = uint8_t(v);
+        workram_[o + 1] = uint8_t(v >> 8);
+    };
+    auto rd16 = [this](uint32_t o) { return uint16_t(workram_[o] | workram_[o + 1] << 8); };
+    constexpr uint32_t kClearedLevels = 0xe5c4, kCurrentLevel = 0xf06e, kCurrentLevelStatus = 0xf0bc, kLevelOrderArray = 0x263a;
+    wr16(kClearedLevels, uint16_t((rd16(kClearedLevels) & ~mem_mask) | (data & mem_mask))); // COMBINE_DATA
+    const uint16_t cleared = rd16(kClearedLevels);
+    uint16_t level;
+    if (cleared == 0) level = 0x0007;
+    else {
+        const uint8_t *rom = roms_.main.data();
+        level = rom[kLevelOrderArray + cleared * 2 - 1];
+        level |= uint16_t(rom[kLevelOrderArray + cleared * 2 - 2] << 8);
+    }
+    wr16(kCurrentLevel, level);
+    wr16(kCurrentLevelStatus, 0);
+    wr16(kCurrentLevelStatus + 2, 0);
+}
+
+// ---- uPD4701A ----
+
+void Upd4701::cs_w(bool state) {
+    if (cs == state) return;
+    cs = state;
+    if (!cs) {
+        latchx = int16_t((x - startx) & kMask);
+        latchy = int16_t((y - starty) & kMask);
+        latchswitches = switches;
+        if (switches != 0) latchswitches |= 8;
+        if (!cf) cf = true;
+    }
+}
+
+uint8_t Upd4701::d_r() const {
+    if (cs) return 0; // open bus (unset: 0)
+    uint16_t data = uint16_t(xy ? latchy : latchx);
+    data = uint16_t(data | latchswitches << 12);
+    return ul ? uint8_t(data >> 8) : uint8_t(data & 0xff);
+}
+
+uint8_t Upd4701::read_xy(int offset) {
+    const bool old_cs = cs;
+    cs_w(false);
+    xy = (offset >> 1) & 1;
+    ul = offset & 1;
+    const uint8_t r = d_r();
+    cs_w(old_cs);
+    return r;
+}
+
+void Upd4701::reset_xy_w() {
+    // resetx_w(1), resety_w(1), resetx_w(0), resety_w(0)
+    if (!resetx) { resetx = true; startx = x; }
+    if (!resety) { resety = true; starty = y; }
+    resetx = false;
+    resety = false;
+}
+
+void Upd4701::update(uint16_t px, uint16_t py) {
+    const uint16_t nx = px & kMask, ny = py & kMask;
+    const int16_t dx = int16_t(uint16_t(nx - last_x_read)), dy = int16_t(uint16_t(ny - last_y_read));
+    if (!resetx && dx != 0) {
+        x = int16_t(x + dx);
+        if (cs && cf) cf = false;
+    }
+    last_x_read = nx;
+    if (!resety && dy != 0) {
+        y = int16_t(y + dy);
+        if (cs && cf) cf = false;
+    }
+    last_y_read = ny;
+}
 
 void Board::start_of_vblank_int() {
     signal_v60_irq(MAIN_IRQ_VBSTART);
@@ -582,7 +730,7 @@ void Board::start_of_vblank_int() {
 // ---- comm board, EPR-15033 mode, with no other cabinet ----
 
 void Board::comm_tick() {
-    if (comm_linkenable_ != 1) return;
+    if (comm_linkenable_ != 1 || roms_.comm_link == 0) return; // 0: no link type (s32comm does nothing)
     if (roms_.comm_link == 14084) {
         comm_tick_14084();
         return;

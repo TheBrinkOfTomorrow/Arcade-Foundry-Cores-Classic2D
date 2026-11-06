@@ -39,6 +39,9 @@ public:
     bool executing() const;
     void abort_timeslice();
     attotime cycles_to_attotime(int64_t cycles) const;
+    // device_execute_interface::interface_clock_changed (no resync): a new
+    // cycle rate, as when a CPU's clock divider changes
+    void set_cycles_per_second(uint32_t hz);
 
     // suspension (MAME's SUSPEND_REASON_RESET / _HALT)
     void suspend(bool eat) { suspended_ = true; eatcycles_ = eat; }

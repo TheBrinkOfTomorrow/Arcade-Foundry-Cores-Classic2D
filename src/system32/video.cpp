@@ -93,6 +93,10 @@ struct Video::Impl {
     std::unique_ptr<int32_t[]> m_prev_bgstartx, m_prev_bgendx, m_bgcolor_line;
     std::vector<Page> pages_;
     rectangle visarea_{0, 52 * 8 - 1, 0, 28 * 8 - 1};
+    // each screen's visible area as the screen had it before the update in
+    // progress (set_visarea: 416 at power on), and the cliprect drawn last
+    rectangle screen_visarea_[2] = {{0, 52 * 8 - 1, 0, 28 * 8 - 1}, {0, 52 * 8 - 1, 0, 28 * 8 - 1}};
+    rectangle drawn_{0, 52 * 8 - 1, 0, 28 * 8 - 1};
 
     Impl(Video &video, const std::vector<uint8_t> &tiles, const std::vector<uint8_t> &sprites, bool multi32)
         : v(video), m_is_multi32(multi32), m_videoram(video.videoram.data()), m_spriteram(video.spriteram.data()) {
@@ -1073,7 +1077,7 @@ void Video::power_on() {
     std::memset(mixer, 0xff, sizeof mixer[0][0] * 0x80);
 }
 
-int Video::width() const { return p_->visarea_.max_x + 1; }
+int Video::width() const { return p_->drawn_.max_x + 1; }
 
 uint16_t Video::palette_r(int which, uint32_t offset) const {
     const bool convert = (offset >> 14) & 1;
@@ -1144,8 +1148,13 @@ void Video::update_sprites() {
 
 void Video::render(int index, uint32_t *out) {
     // multi32_update: the visible area from 0x1ff00 bit 15 (416 or 320)
+    // the update draws the screen's visible area as it was (the cliprect
+    // MAME's screen passes in); set_visible_area takes effect from the next
+    // frame, though the clips below already see the new one
+    const rectangle cliprect = p_->screen_visarea_[index];
     p_->visarea_ = {0, (videoram[0x1ff00 / 2] & 0x8000) ? 52 * 8 - 1 : 40 * 8 - 1, 0, 28 * 8 - 1};
-    const rectangle cliprect = p_->visarea_;
+    p_->screen_visarea_[index] = p_->visarea_;
+    p_->drawn_ = cliprect;
     if (!displayenable[index]) {
         for (int y = 0; y < kHeight; ++y) std::fill_n(out + size_t(y) * kWidth, kWidth, 0u);
         return;

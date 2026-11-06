@@ -21,6 +21,18 @@ Exec::Exec(Scheduler &s, std::string name, uint32_t clock_hz)
     s.add_exec(this);
 }
 
+void Exec::set_cycles_per_second(uint32_t hz) {
+    cycles_per_second_ = hz;
+    attoseconds_per_cycle_ = hz_to_attoseconds(hz);
+    attoseconds_t attos = attoseconds_per_cycle_;
+    divshift_ = 0;
+    while (attos >= (int64_t(1) << 31)) {
+        divshift_++;
+        attos >>= 1;
+    }
+    divisor_ = uint32_t(attos);
+}
+
 bool Exec::executing() const { return sched_.executing_ == this; }
 
 attotime Exec::cycles_to_attotime(int64_t cycles) const {

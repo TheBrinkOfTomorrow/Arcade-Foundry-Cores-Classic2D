@@ -4,6 +4,7 @@
 // then the reads, the operation and the write.
 #include "cpu68k/interp.h"
 
+#include "m68k/musashi_timing.h"
 #include "m68k/timing.h"
 
 #include <cstdio>
@@ -135,6 +136,23 @@ bool Interp::step(Env &e, const Insn &in) {
     Cpu &c = e.c;
     const uint32_t pc = in.addr;
     // the slice's end, as the generated block's head (m68krecomp emit)
+    if (c.musashi) { // MAME's Musashi core (m68krecomp --musashi): no splits, accesses at the start
+        if (c.cyc >= e.stop) { c.pc = pc; return false; }
+        if (c.insns >= e.hook_at && e.on_hook) e.on_hook(pc);
+        c.npc = pc + in.length;
+        const unsigned mc = musashi_fixed_cycles(in);
+        c.cyc += mc;
+        c.late_r = c.late_w = c.late = int(mc);
+        uint32_t target = 0;
+        const Next nx = exec(e, in, target);
+        ++c.insns;
+        ++instructions;
+        switch (nx) {
+        case Next::Fall: c.pc = pc + in.length; return true;
+        case Next::Jump: c.pc = target; return true;
+        default: return false;
+        }
+    }
     const unsigned d = data_offset(in) + flow_data_offset(in);
     auto split = [&] {
         c.split = true;
@@ -199,6 +217,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
     uint32_t *const A = c.a;
     const uint32_t pc = in.addr, next = pc + in.length;
     const unsigned sz = in.size;
+    const bool msh = c.musashi;
     auto priv = [&] {
         if (!(c.sys & 0x2000)) fault(c, "privilege violation", pc);
     };
@@ -223,7 +242,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
     case Op::Pea: c.push32(ea_addr(c, in.src, 4)); break;
     case Op::Clr: {
         const Opnd dst = opnd(c, in.dst, sz);
-        if (in.dst.is_mem()) (void)dst.get(c);
+        if (in.dst.is_mem() && !msh) (void)dst.get(c);
         dst.put(c, logic(0));
         break;
     }
@@ -274,14 +293,17 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
         uint32_t &r = D[in.dst.reg];
         if (in.op == Op::Mulu) r = m68k::logic<4>(c, (r & 0xffffu) * sv);
         else r = m68k::logic<4>(c, uint32_t(int32_t(int16_t(r)) * int32_t(int16_t(sv))));
-        c.cyc += in.op == Op::Mulu ? mulu_cycles(sv) : muls_cycles(sv);
+        if (!msh) c.cyc += in.op == Op::Mulu ? mulu_cycles(sv) : muls_cycles(sv);
         break;
     }
     case Op::Divu: case Op::Divs: {
         const uint32_t dv = opnd(c, in.src, 2).get(c);
         uint32_t &r = D[in.dst.reg];
         if (!dv) fault(c, "divide by zero", pc);
-        if (in.op == Op::Divu) {
+        if (msh) {
+            if (in.op == Op::Divu) divu_musashi(c, r, dv);
+            else divs_musashi(c, r, dv);
+        } else if (in.op == Op::Divu) {
             c.cyc += divu_cycles(r, uint16_t(dv));
             const uint32_t q = r / dv, m = r % dv;
             c.c = 0;
@@ -292,7 +314,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
             const int32_t n = int32_t(r), dd = int16_t(dv);
             const int64_t q = int64_t(n) / dd, m = int64_t(n) % dd;
             c.c = 0;
-            if (q > 32767 || q < -32768) { c.v = 1; c.n = 1; }
+            if (q > 32767 || q < -32768) { c.v = 1; c.n = 1; c.z = 0; } // MAME clears Z (Super Monaco GP's IC test)
             else { r = (uint32_t(m) << 16) | (uint32_t(q) & 0xffffu); m68k::logic<2>(c, uint32_t(q)); }
         }
         break;
@@ -312,7 +334,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
         if (in.op == Op::Bchg) dst.put(c, v ^ (1u << nb));
         if (in.op == Op::Bclr) dst.put(c, v & ~(1u << nb));
         if (in.op == Op::Bset) dst.put(c, v | (1u << nb));
-        if (reg && in.op != Op::Btst && nb >= 16) c.cyc += 2;
+        if (reg && in.op != Op::Btst && nb >= 16 && !msh) c.cyc += 2;
         break;
     }
     case Op::Asl: case Op::Asr: case Op::Lsl: case Op::Lsr: case Op::Roxl: case Op::Roxr: case Op::Rol: case Op::Ror: {
@@ -338,14 +360,14 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
             const unsigned n = D[in.src.reg] & 63u;
             const Opnd dst = opnd(c, in.dst, sz);
             dst.put(c, shift(sz, dst.get(c), n));
-            c.cyc += 2 * n;
+            if (!msh) c.cyc += 2 * n;
         }
         break;
     }
     case Op::Scc: {
         const Opnd dst = opnd(c, in.dst, 1);
         const bool t = cond(c, in.cond);
-        if (in.dst.is_mem()) (void)dst.get(c);
+        if (in.dst.is_mem() && !msh) (void)dst.get(c);
         dst.put(c, t ? 0xffu : 0u);
         if (in.dst.mode == Mode::Dn) {
             if (t) { c.cyc += 2; c.ys = c.cyc - 2; }
@@ -392,6 +414,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
         const uint16_t sr = c.pop16();
         c.pc = c.pop32();
         c.set_sr(sr);
+        c.instr_mode = 0;
         return Next::Return; // the board checks for a pending interrupt
     }
     case Op::MoveToSr: {
@@ -402,7 +425,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
     }
     case Op::MoveFromSr: {
         const Opnd dst = opnd(c, in.dst, 2);
-        if (in.dst.is_mem()) (void)dst.get(c);
+        if (in.dst.is_mem() && !msh) (void)dst.get(c);
         dst.put(c, c.sr());
         break;
     }
@@ -423,19 +446,44 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
         const unsigned n = sz;
         auto reg = [&](int i) -> uint32_t & { return i < 8 ? D[i] : A[i & 7]; };
         if (in.to_mem) {
+            // each word at its own bus time, as the recompiler emits it
+            // (MAME's 68000: a word every 4 cycles after the prefetch, -(An)
+            // low word first)
+            unsigned cnt = 0;
+            for (int i = 0; i < 16; ++i) cnt += (in.mask >> i) & 1;
+            const unsigned base = in.dst.mode == Mode::Ind || in.dst.mode == Mode::PreDec ? 8
+                                : in.dst.mode == Mode::Index ? 14 : in.dst.mode == Mode::AbsL ? 16 : 12;
+            const unsigned total = base + cnt * (n == 4 ? 8 : 4), first = flow_data_offset(in);
+            unsigned k = 0;
+            auto word = [&](uint32_t at, uint32_t v) {
+                if (!msh) c.late_w = int(total - first - 4 * k);
+                ++k;
+                c.w16(at, v);
+            };
+            auto store = [&](uint32_t at, uint32_t v, bool low_first) {
+                if (n == 2) return word(at, v);
+                if (msh) return wr(c, at, 4, v);
+                if (low_first) {
+                    word(at + 2, v);
+                    word(at, v >> 16);
+                } else {
+                    word(at, v >> 16);
+                    word(at + 2, v);
+                }
+            };
             if (in.dst.mode == Mode::PreDec) { // mask bit 0 is A7; registers stored from A7 down
                 uint32_t a = A[in.dst.reg];
                 for (int bit = 0; bit < 16; ++bit)
                     if (in.mask & (1u << bit)) {
                         a -= n;
-                        wr(c, a, n, reg(15 - bit));
+                        store(a, reg(15 - bit), true);
                     }
                 A[in.dst.reg] = a;
             } else {
                 uint32_t a = ea_addr(c, in.dst, n);
                 for (int i = 0; i < 16; ++i)
                     if (in.mask & (1u << i)) {
-                        wr(c, a, n, reg(i));
+                        store(a, reg(i), false);
                         a += n;
                     }
             }
@@ -447,7 +495,7 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
                     reg(i) = n == 2 ? sext<2>(c.r16(a)) : c.r32(a);
                     a += n;
                 }
-            (void)c.r16(a); // the 68000 reads one word past the list
+            if (!msh) (void)c.r16(a); // the 68000 reads one word past the list
             if (post) A[in.src.reg] = a;
         }
         break;
@@ -466,22 +514,30 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
         dst.put(c, v | 0x80u);
         break;
     }
-    case Op::Abcd: binop([&](uint32_t s, uint32_t d) { return abcd(c, s, d); }); break;
-    case Op::Sbcd: binop([&](uint32_t s, uint32_t d) { return sbcd(c, s, d); }); break;
+    case Op::Abcd: binop([&](uint32_t s, uint32_t d) { return msh ? abcd_musashi(c, s, d) : abcd(c, s, d); }); break;
+    case Op::Sbcd: binop([&](uint32_t s, uint32_t d) { return msh ? sbcd_musashi(c, s, d) : sbcd(c, s, d); }); break;
     case Op::Nbcd: {
         const Opnd dst = opnd(c, in.dst, 1);
-        dst.put(c, sbcd(c, dst.get(c), 0));
+        dst.put(c, msh ? nbcd_musashi(c, dst.get(c)) : sbcd(c, dst.get(c), 0));
         break;
     }
     case Op::Movep: {
         const Ea &m = in.to_mem ? in.dst : in.src;
         const uint32_t a = A[m.reg] + uint32_t(m.disp);
         uint32_t &r = D[(in.to_mem ? in.src : in.dst).reg];
+        // np, then one byte access every 4 cycles (MAME: each at its start)
+        const int len = sz == 4 ? 24 : 16;
         if (in.to_mem)
-            for (unsigned i = 0; i < sz; ++i) c.w8(a + 2 * i, r >> (8 * (sz - 1 - i)));
+            for (unsigned i = 0; i < sz; ++i) {
+                c.late_w = msh ? len : len - 4 - 4 * int(i);
+                c.w8(a + 2 * i, r >> (8 * (sz - 1 - i)));
+            }
         else {
             uint32_t v = 0;
-            for (unsigned i = 0; i < sz; ++i) v = (v << 8) | c.r8(a + 2 * i);
+            for (unsigned i = 0; i < sz; ++i) {
+                c.late_r = msh ? len : len - 4 - 4 * int(i);
+                v = (v << 8) | c.r8(a + 2 * i);
+            }
             r = sz == 2 ? (r & 0xffff0000u) | v : v;
         }
         break;
@@ -490,7 +546,8 @@ Interp::Next Interp::exec(Env &e, const Insn &in, uint32_t &target) {
         const int16_t bound = int16_t(opnd(c, in.src, 2).get(c));
         const int16_t v = int16_t(D[in.dst.reg]);
         if (v < 0 || v > bound) fault(c, "chk exception", pc);
-        c.n = 0;
+        if (msh) { c.z = v == 0; c.v = 0; c.c = 0; }
+        else c.n = 0;
         break;
     }
     case Op::Trap: c.exception(32 + in.data, next); return Next::Return;

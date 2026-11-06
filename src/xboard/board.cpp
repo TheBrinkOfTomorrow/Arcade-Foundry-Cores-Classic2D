@@ -245,6 +245,7 @@ enum Dev {
     kDivSub,
     kCmpSub,
     kRoadControl,
+    kLoffireSync, // Line of Fire: subram0's first 0x12 bytes from the main CPU (install_loffire)
     kWriteIgnored, // ROM pages: writes go nowhere
 };
 } // namespace
@@ -312,6 +313,15 @@ void Board::io_write(int dev, uint32_t a, uint16_t d, uint16_t m) {
     case kRoadControl:
         if (m & 0x00ff) road_control = uint8_t(d & 7);
         return;
+    case kLoffireSync: {
+        // loffire_sync0_w at 0x29c000-0x29c011 (a quantum boost); the rest
+        // of the page is plain subram0
+        const uint32_t off = a & 0x3ffe;
+        if (m & 0xff00) subram0[off] = uint8_t(d >> 8);
+        if (m & 0x00ff) subram0[off + 1] = uint8_t(d);
+        if ((a & 0xfff) < 0x12) sched_.add_quantum(attotime::from_ticks(4, kCpuClock), attotime::from_usec(10));
+        return;
+    }
     default: return;
     }
 }
@@ -328,6 +338,12 @@ Board::Board(Roms roms) : in(Inputs::for_game(roms.game)), roms_(std::move(roms)
     sound_ = std::make_unique<Sound>(sched_, roms_.sound, roms_.pcm);
     sound_->ym_irq_to_cpu = true;
     sound_->port_40_read = [this] { return cmptimer_main_.zread(); };
+    if (roms_.game == Game::smgp) {
+        // Super Monaco GP's extra sound board: soundcpu2 and pcm2 (the comm
+        // and motor boards' Z80s run alone in MAME and touch nothing here)
+        sound2_ = std::make_unique<Sound>(sched_, roms_.sound2, roms_.pcm2, "soundcpu2", false);
+        sound2_->port_40_read = [this] { return cmptimer_main_.zread(); };
+    }
     if (!roms_.video.tiles.empty()) {
         orun::VideoView v;
         v.sprite_buffer = sprite_buffer.data();
@@ -342,7 +358,7 @@ Board::Board(Roms roms) : in(Inputs::for_game(roms.game)), roms_(std::move(roms)
         v.latched_yscroll = latched_yscroll;
         v.latched_xscroll = latched_xscroll;
         orun::VideoConfig cfg = orun::VideoConfig::xboard_board();
-        if (roms_.game == Game::aburner2) cfg.road_priority = false; // install_aburner2: m_road_priority = 0
+        if (is_aburner(roms_.game)) cfg.road_priority = false; // install_aburner2: m_road_priority = 0
         video_ = std::make_unique<Video>(std::move(roms_.video), cfg, v);
     }
     if (!roms_.fd1094_key.empty()) {
@@ -377,7 +393,10 @@ Board::Board(Roms roms) : in(Inputs::for_game(roms.game)), roms_(std::move(roms)
 
     // the main 315-5250: IRQ 2 and the sound CPU's NMI
     cmptimer_main_.m68kint = [this](bool s) { timer_irq_w(s); };
-    cmptimer_main_.zint = [this](bool s) { sound_->cpu().set_input_line(z80::INPUT_LINE_NMI, s ? z80::ASSERT_LINE : z80::CLEAR_LINE); };
+    cmptimer_main_.zint = [this](bool s) {
+        sound_->cpu().set_input_line(z80::INPUT_LINE_NMI, s ? z80::ASSERT_LINE : z80::CLEAR_LINE);
+        if (sound2_) sound2_->cpu().set_input_line(z80::INPUT_LINE_NMI, s ? z80::ASSERT_LINE : z80::CLEAR_LINE);
+    };
     cmptimer_main_.sync_write_to_sound = [this](uint8_t d) {
         sched_.synchronize([this](int32_t p) { cmptimer_main_.write_to_sound(uint8_t(p)); }, d);
     };
@@ -385,7 +404,8 @@ Board::Board(Roms roms) : in(Inputs::for_game(roms.game)), roms_(std::move(roms)
     // I/O chips: port A is aburner2_motor_r, or xboard_generic's IO0PORTA
     // for Thunder Blade (the same bits)
     // D6 is the ADC0804's INTR line, active low (intr_r)
-    iochip_[0].in[0] = [this] { return uint8_t(0x80 | (adc_intr_ ? 0 : 0x40) | 0x3f); };
+    // (smgp_motor_r keeps D7-D6 only)
+    iochip_[0].in[0] = [this] { return uint8_t(0x80 | (adc_intr_ ? 0 : 0x40) | (roms_.game == Game::smgp ? 0 : 0x3f)); };
     iochip_[0].in[1] = [this] { return in.io0_portb; };
     iochip_[0].out[1] = [](uint8_t) {}; // aburner2_motor_w
     iochip_[0].out[2] = [this](uint8_t d) { pc_0_w(d); };
@@ -399,13 +419,19 @@ Board::Board(Roms roms) : in(Inputs::for_game(roms.game)), roms_(std::move(roms)
     watchdog_timer_ = sched_.timer_alloc([](int32_t) { throw m68k::Fatal("watchdog expired"); }, "mb3773_device::watchdog_expired");
     adc_timer_ = sched_.timer_alloc([this](int32_t) {
         // analog_r: the port selected by port C D4-D2 when the conversion ends
-        adc_result_ = in.adc[(pc_0_ >> 2) & 7];
+        const int which = (pc_0_ >> 2) & 7;
+        adc_result_ = in.adc[which];
+        // install_loffire: m_adc_reverse[1] and [3] (the guns' Y)
+        if (roms_.game == Game::loffire && (which == 1 || which == 3)) adc_result_ = uint8_t(255 - adc_result_);
         adc_intr_ = true;
     }, "adc0804_device::conversion_done");
     vblank_begin_timer_ = sched_.timer_alloc([this](int32_t) { vblank_begin(); }, "screen_device::vblank_begin");
     vblank_end_timer_ = sched_.timer_alloc([this](int32_t) { vblank_end(); }, "screen_device::vblank_end");
     scanline0_timer_ = sched_.timer_alloc([this](int32_t) { reset_partial_updates(); }, "screen_device::first_scanline_tick");
-    sound_update_timer_ = sched_.timer_alloc([this](int32_t) { sound_->update_streams(); }, "sound_manager::update");
+    sound_update_timer_ = sched_.timer_alloc([this](int32_t) {
+        sound_->update_streams();
+        if (sound2_) sound2_->update_streams();
+    }, "sound_manager::update");
     latch_timer_ = sched_.timer_alloc([this](int32_t p) {
         for (int i = 0; i < 4; ++i) {
             auto w = [&](uint32_t off) { return uint16_t(textram[off * 2] << 8 | textram[off * 2 + 1]); };
@@ -428,6 +454,7 @@ Board::Board(Roms roms) : in(Inputs::for_game(roms.game)), roms_(std::move(roms)
     }
     sound_update_timer_->adjust(attotime::from_hz(50u), 0, attotime::from_hz(50u));
     sound_->power_on();
+    if (sound2_) sound2_->power_on();
 
     reset();
 }
@@ -483,6 +510,7 @@ void Board::install_main_map() {
         put(0x200000, 0x80000, roms_.sub.data(), nullptr, h[kWriteIgnored]);
         mirror(0x280000, 0x4000, 0x20000, subram0.data(), subram0.data(), nullptr);
         mirror(0x2a0000, 0x4000, 0x20000, subram1.data(), subram1.data(), nullptr);
+        if (roms_.game == Game::loffire) put(0x29c000, 0x1000, subram0.data(), nullptr, h[kLoffireSync]);
         put(0x2e0000, 0x4000, nullptr, nullptr, h[kMultSub]);
         put(0x2e4000, 0x4000, nullptr, nullptr, h[kDivSub]);
         put(0x2e8000, 0x4000, nullptr, nullptr, h[kCmpSub]);
@@ -525,6 +553,7 @@ void Board::pc_0_w(uint8_t data) {
         display_enable = data & 0x20;
     }
     sound_->cpu().set_reset_line((data & 1) ? z80::CLEAR_LINE : z80::ASSERT_LINE);
+    if (sound2_) sound2_->cpu().set_reset_line((data & 1) ? z80::CLEAR_LINE : z80::ASSERT_LINE);
 }
 
 void Board::pd_0_w(uint8_t data) {
@@ -560,6 +589,7 @@ void Board::update_main_irqs() {
         main_->set_input_line(4, kClear);
         watchdog_ck(1);
     }
+    if (roms_.game == Game::gprider && irq > 4) irq = 4; // MAME's gprider_hack
     if (irq != 6) main_->set_input_line(6, kClear);
     if (irq) {
         main_->set_input_line(irq, kAssert);
