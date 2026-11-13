@@ -156,6 +156,7 @@ version = "Japan, Rev C"
 core_version = "1.0.0"
 controls = "fighting"
 players = 2
+category = "other"
 
 [[game]]
 set = "ga2"

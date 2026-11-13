@@ -2,6 +2,17 @@
 
 Newest first. Each release is also on the repository's Releases page.
 
+## 1.3.0 (2026-11-12)
+
+**Arcade Foundry Cores: Classic 2D 1.3.0**
+
+The Classic 2D cores as shipped with Insert Coin 1.3.0. The games are
+unchanged since 1.2.0.
+
+- **Game categories:** the app's library groups games by category, taken
+  from each game's controls; games.toml sets one by hand where the controls
+  give the wrong answer.
+
 ## 1.2.0 (2026-11-06)
 
 **Arcade Foundry Cores: Classic 2D 1.2.0**
